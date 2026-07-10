@@ -4,7 +4,7 @@
   "binary_name": "atctl",
   "desc": "CLI/TUI AT command controller for USB cellular modems",
   "homepage": "https://github.com/uchimanajet7/atctl",
-  "source_url_template": "https://github.com/uchimanajet7/atctl/archive/refs/tags/%{tag}.tar.gz",
+  "source_url_template": "https://github.com/uchimanajet7/atctl/archive/refs/tags/%<tag>s.tar.gz",
   "license": "MIT",
   "build_dependencies": [
     "pkgconf",

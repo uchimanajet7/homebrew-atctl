@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+# typed: strict
 # frozen_string_literal: true
 
 require "digest"
@@ -9,9 +10,11 @@ require "optparse"
 require "timeout"
 require "uri"
 
-class FormulaUpdateError < StandardError; end
-
+# Generates an atctl Homebrew formula from release metadata.
 class FormulaUpdater
+  # Raised when release metadata or generated formula input is invalid.
+  class Error < StandardError; end
+
   TAG_PATTERN = /\Av?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/
   SHA256_PATTERN = /\A[0-9a-f]{64}\z/
   MAX_REDIRECTS = 5
@@ -41,14 +44,14 @@ class FormulaUpdater
   def validate_tag!
     return if @tag.match?(TAG_PATTERN)
 
-    raise FormulaUpdateError,
+    raise Error,
           "release tag must look like a semver tag, for example v0.1.0: #{@tag.inspect}"
   end
 
   def validate_sha256!
     return if @sha256.match?(SHA256_PATTERN)
 
-    raise FormulaUpdateError, "sha256 must be 64 lowercase hexadecimal characters: #{@sha256.inspect}"
+    raise Error, "sha256 must be 64 lowercase hexadecimal characters: #{@sha256.inspect}"
   end
 
   def load_config
@@ -66,18 +69,18 @@ class FormulaUpdater
         test_args
       ]
       missing = required_keys.reject { |key| config.key?(key) }
-      raise FormulaUpdateError, "missing config keys: #{missing.join(", ")}" unless missing.empty?
+      raise Error, "missing config keys: #{missing.join(", ")}" unless missing.empty?
 
-      unless config.fetch("source_url_template").include?("%{tag}")
-        raise FormulaUpdateError, "source_url_template must include %{tag}"
+      unless config.fetch("source_url_template").include?("%<tag>s")
+        raise Error, "source_url_template must include %<tag>s"
       end
     end
   rescue JSON::ParserError => e
-    raise FormulaUpdateError, "invalid JSON in #{@config_path}: #{e.message}"
+    raise Error, "invalid JSON in #{@config_path}: #{e.message}"
   end
 
   def source_url(config)
-    config.fetch("source_url_template").sub("%{tag}", @tag)
+    format(config.fetch("source_url_template"), tag: @tag)
   end
 
   def sha256_for(url)
@@ -85,12 +88,10 @@ class FormulaUpdater
   end
 
   def fetch(url, redirects = 0)
-    raise FormulaUpdateError, "too many redirects while fetching #{url}" if redirects > MAX_REDIRECTS
+    raise Error, "too many redirects while fetching #{url}" if redirects > MAX_REDIRECTS
 
     uri = URI(url)
-    unless uri.is_a?(URI::HTTPS)
-      raise FormulaUpdateError, "source archive URL must use https: #{url}"
-    end
+    raise Error, "source archive URL must use https: #{url}" unless uri.is_a?(URI::HTTPS)
 
     Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 120) do |http|
       request = Net::HTTP::Get.new(uri)
@@ -102,15 +103,15 @@ class FormulaUpdater
         response.body
       when Net::HTTPRedirection
         location = response["location"]
-        raise FormulaUpdateError, "redirect without location while fetching #{url}" if location.nil?
+        raise Error, "redirect without location while fetching #{url}" if location.nil?
 
         fetch(URI.join(uri, location).to_s, redirects + 1)
       else
-        raise FormulaUpdateError, "failed to fetch #{url}: HTTP #{response.code} #{response.message}"
+        raise Error, "failed to fetch #{url}: HTTP #{response.code} #{response.message}"
       end
     end
   rescue SocketError, SystemCallError, Timeout::Error => e
-    raise FormulaUpdateError, "failed to fetch #{url}: #{e.class}: #{e.message}"
+    raise Error, "failed to fetch #{url}: #{e.class}: #{e.message}"
   end
 
   def write_formula(path, content)
@@ -163,8 +164,8 @@ end
 
 options = {
   config_path: "config/atctl-formula.json",
-  tag: ENV["ATCTL_RELEASE_TAG"],
-  sha256: ENV["ATCTL_SOURCE_SHA256"]
+  tag:         ENV.fetch("ATCTL_RELEASE_TAG", nil),
+  sha256:      ENV.fetch("ATCTL_SOURCE_SHA256", nil),
 }
 
 OptionParser.new do |parser|
@@ -194,7 +195,7 @@ end
 
 begin
   FormulaUpdater.new(options).run
-rescue FormulaUpdateError => e
+rescue FormulaUpdater::Error => e
   warn e.message
   exit 1
 end
