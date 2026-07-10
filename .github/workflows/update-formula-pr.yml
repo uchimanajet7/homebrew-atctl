@@ -1,0 +1,65 @@
+name: Update Formula PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag from uchimanajet7/atctl, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-formula:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out tap
+        uses: actions/checkout@v4
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update formula from release tag
+        run: ruby scripts/update-formula.rb --tag "${{ inputs.tag }}"
+
+      - name: Show formula changes
+        run: |
+          git status --short -- Formula/atctl.rb
+          git diff -- Formula/atctl.rb
+
+      - name: Check formula style
+        run: brew style Formula/atctl.rb
+
+      - name: Audit formula
+        run: brew audit --strict --online Formula/atctl.rb
+
+      - name: Create formula update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --short -- Formula/atctl.rb)" ]; then
+            echo "Formula/atctl.rb is already up to date for ${RELEASE_TAG}."
+            exit 0
+          fi
+
+          SAFE_TAG="${RELEASE_TAG//[^A-Za-z0-9._-]/-}"
+          BRANCH="formula/${SAFE_TAG}"
+
+          git checkout -B "${BRANCH}"
+          git add Formula/atctl.rb
+          git commit -m "Update atctl formula to ${RELEASE_TAG}"
+          git push --force-with-lease origin "${BRANCH}"
+          gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "${BRANCH}" \
+            --title "Update atctl formula to ${RELEASE_TAG}" \
+            --body "Updates Formula/atctl.rb for uchimanajet7/atctl ${RELEASE_TAG} using scripts/update-formula.rb."

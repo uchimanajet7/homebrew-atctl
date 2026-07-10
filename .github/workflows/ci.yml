@@ -1,0 +1,78 @@
+name: Formula CI
+
+on:
+  pull_request:
+    paths:
+      - "Formula/**"
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Formula/**"
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+jobs:
+  formula:
+    strategy:
+      matrix:
+        os: [macos-15-intel, macos-26]
+        include:
+          - os: ubuntu-latest
+            container: ghcr.io/homebrew/brew:main
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Homebrew Bundler RubyGems
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.set-up-homebrew.outputs.gems-path }}
+          key: ${{ matrix.os }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
+          restore-keys: ${{ matrix.os }}-rubygems-
+
+      - name: Detect formula
+        id: formula
+        run: |
+          if [ -f Formula/atctl.rb ]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Formula/atctl.rb does not exist yet; skipping formula checks."
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Clean before test-bot
+        run: brew test-bot --only-cleanup-before
+
+      - name: Set up test-bot
+        run: brew test-bot --only-setup
+
+      - name: Check tap syntax
+        run: brew test-bot --only-tap-syntax
+
+      - name: Build, test, and bottle formulae
+        if: steps.formula.outputs.exists == 'true'
+        run: brew test-bot --only-formulae --testing-formulae=atctl
+
+      - name: Upload bottles as artifact
+        if: always() && steps.formula.outputs.exists == 'true' && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bottles_${{ matrix.os }}
+          path: "*.bottle.*"
