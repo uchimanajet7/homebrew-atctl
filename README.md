@@ -2,6 +2,10 @@
 
 Homebrew tap for [atctl](https://github.com/uchimanajet7/atctl), a CLI/TUI AT command controller for USB cellular modems.
 
+## Supported Platform
+
+The currently supported and validated platform is macOS on Apple Silicon (arm64).
+
 ## Install
 
 ```sh

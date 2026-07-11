@@ -18,6 +18,12 @@ class FormulaUpdater
   TAG_PATTERN = /\Av?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/
   SHA256_PATTERN = /\A[0-9a-f]{64}\z/
   MAX_REDIRECTS = 5
+  OS_REQUIREMENTS = {
+    "macos" => "depends_on :macos",
+  }.freeze
+  ARCH_REQUIREMENTS = {
+    "arm64" => "depends_on arch: :arm64",
+  }.freeze
 
   def initialize(options)
     @config_path = options.fetch(:config_path)
@@ -64,6 +70,7 @@ class FormulaUpdater
         homepage
         source_url_template
         license
+        requirements
         build_dependencies
         dependencies
         test_args
@@ -74,9 +81,33 @@ class FormulaUpdater
       unless config.fetch("source_url_template").include?("%<tag>s")
         raise Error, "source_url_template must include %<tag>s"
       end
+
+      validate_requirements!(config.fetch("requirements"))
     end
   rescue JSON::ParserError => e
     raise Error, "invalid JSON in #{@config_path}: #{e.message}"
+  end
+
+  def validate_requirements!(requirements)
+    unless requirements.is_a?(Hash)
+      raise Error, "requirements must be an object with os and arch keys"
+    end
+
+    required_keys = %w[os arch]
+    missing = required_keys.reject { |key| requirements.key?(key) }
+    raise Error, "missing requirement keys: #{missing.join(", ")}" unless missing.empty?
+
+    unknown = requirements.keys - required_keys
+    raise Error, "unknown requirement keys: #{unknown.join(", ")}" unless unknown.empty?
+
+    os = requirements.fetch("os")
+    arch = requirements.fetch("arch")
+    unless OS_REQUIREMENTS.key?(os)
+      raise Error, "unsupported Formula operating system requirement: #{os.inspect}"
+    end
+    return if ARCH_REQUIREMENTS.key?(arch)
+
+    raise Error, "unsupported Formula architecture requirement: #{arch.inspect}"
   end
 
   def source_url(config)
@@ -132,9 +163,12 @@ class FormulaUpdater
     config.fetch("build_dependencies").each do |dependency|
       lines << "  depends_on #{ruby_string(dependency)} => :build"
     end
+    requirements = config.fetch("requirements")
+    lines << "  #{ARCH_REQUIREMENTS.fetch(requirements.fetch("arch"))}"
     config.fetch("dependencies").each do |dependency|
       lines << "  depends_on #{ruby_string(dependency)}"
     end
+    lines << "  #{OS_REQUIREMENTS.fetch(requirements.fetch("os"))}"
     lines << ""
 
     lines << "  def install"

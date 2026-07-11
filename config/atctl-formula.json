@@ -6,6 +6,10 @@
   "homepage": "https://github.com/uchimanajet7/atctl",
   "source_url_template": "https://github.com/uchimanajet7/atctl/archive/refs/tags/%<tag>s.tar.gz",
   "license": "MIT",
+  "requirements": {
+    "os": "macos",
+    "arch": "arm64"
+  },
   "build_dependencies": [
     "pkgconf",
     "rust"

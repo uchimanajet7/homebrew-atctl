@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   update-formula:
-    runs-on: macos-latest
+    runs-on: macos-26
 
     steps:
       - name: Check out tap

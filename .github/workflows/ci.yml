@@ -19,14 +19,8 @@ on:
 
 jobs:
   formula:
-    strategy:
-      matrix:
-        os: [macos-15-intel, macos-26]
-        include:
-          - os: ubuntu-latest
-            container: ghcr.io/homebrew/brew:main
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
+    name: Formula (macOS 26 arm64)
+    runs-on: macos-26
     permissions:
       actions: read
       checks: read
@@ -44,8 +38,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ steps.set-up-homebrew.outputs.gems-path }}
-          key: ${{ matrix.os }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
-          restore-keys: ${{ matrix.os }}-rubygems-
+          key: macos-26-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
+          restore-keys: macos-26-rubygems-
 
       - name: Detect formula
         id: formula
@@ -74,5 +68,5 @@ jobs:
         if: always() && steps.formula.outputs.exists == 'true' && github.event_name == 'pull_request'
         uses: actions/upload-artifact@v7
         with:
-          name: bottles_${{ matrix.os }}
+          name: bottles_macos-26
           path: "*.bottle.*"

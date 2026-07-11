@@ -1,0 +1,180 @@
+name: Check macOS Runner Version
+
+on:
+  schedule:
+    - cron: "23 9 * * 1"
+      timezone: "Asia/Tokyo"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: check-macos-runner
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check stable Apple Silicon macOS runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Fetch runner inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="${RUNNER_TEMP}/macos-runner-check"
+          mkdir -p "${WORK_DIR}"
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/ci.yml?ref=${GITHUB_SHA}" \
+            --jq '.content' | base64 --decode > "${WORK_DIR}/ci.yml"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/update-formula-pr.yml?ref=${GITHUB_SHA}" \
+            --jq '.content' | base64 --decode > "${WORK_DIR}/update-formula-pr.yml"
+          gh api \
+            "repos/actions/runner-images/contents/README.md?ref=main" \
+            --jq '.content' | base64 --decode > "${WORK_DIR}/runner-images.md"
+
+      - name: Detect newer stable runner
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          work_dir = Path(os.environ["RUNNER_TEMP"]) / "macos-runner-check"
+
+
+          def fail(message: str) -> None:
+              print(f"Runner detection failed: {message}", file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def current_runner(path: Path) -> tuple[str, int]:
+              text = path.read_text(encoding="utf-8")
+              matches = re.findall(
+                  r"(?m)^\s*runs-on:\s*(macos-(\d+))\s*(?:#.*)?$",
+                  text,
+              )
+              if len(matches) != 1:
+                  fail(f"expected exactly one fixed macOS runner in {path.name}")
+              label, version = matches[0]
+              return label, int(version)
+
+
+          ci_label, ci_version = current_runner(work_dir / "ci.yml")
+          update_label, update_version = current_runner(
+              work_dir / "update-formula-pr.yml"
+          )
+          if (ci_label, ci_version) != (update_label, update_version):
+              fail(
+                  "ci.yml and update-formula-pr.yml do not use the same fixed "
+                  "macOS runner"
+              )
+
+          catalog = (work_dir / "runner-images.md").read_text(encoding="utf-8")
+          try:
+              available_images = catalog.split("## Available Images", 1)[1].split(
+                  "### Label scheme", 1
+              )[0]
+          except IndexError:
+              fail("the official runner image table could not be located")
+
+          row_pattern = re.compile(
+              r"\|\s*macOS\s+(\d+)\s+Arm64\b.*?"
+              r"(?=\|\s*macOS\s+\d+\b|\|\s*Windows\b|### Label scheme)",
+              re.IGNORECASE | re.DOTALL,
+          )
+          stable_versions: set[int] = set()
+          for match in row_pattern.finditer(available_images):
+              version = int(match.group(1))
+              row = re.sub(r"\s+", " ", match.group(0))
+              if re.search(r"\b(?:preview|deprecated)\b", row, re.IGNORECASE):
+                  continue
+              if not re.search(r"\|\s*arm64\s*\|", row, re.IGNORECASE):
+                  continue
+              if f"`macos-{version}`" not in row:
+                  continue
+              stable_versions.add(version)
+
+          if not stable_versions:
+              fail("no stable Apple Silicon macOS runner was found")
+
+          latest_version = max(stable_versions)
+          latest_label = f"macos-{latest_version}"
+          update_available = latest_version > ci_version
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"current={ci_label}\n")
+              output.write(f"candidate={latest_label}\n")
+              output.write(
+                  f"update_available={'true' if update_available else 'false'}\n"
+              )
+
+          print(f"Current approved runner: {ci_label}")
+          print(f"Latest stable Arm64 runner: {latest_label}")
+          print(f"Update available: {str(update_available).lower()}")
+          PY
+
+      - name: Create runner update issue
+        if: steps.detect.outputs.update_available == 'true'
+        shell: bash
+        env:
+          CURRENT_RUNNER: ${{ steps.detect.outputs.current }}
+          CANDIDATE_RUNNER: ${{ steps.detect.outputs.candidate }}
+        run: |
+          set -euo pipefail
+
+          TITLE="Review GitHub Actions runner update: ${CURRENT_RUNNER} -> ${CANDIDATE_RUNNER}"
+          EXISTING_URL="$(
+            gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state all \
+              --limit 1000 \
+              --json title,url \
+              --jq ".[] | select(.title == \"${TITLE}\") | .url" | \
+              sed -n '1p'
+          )"
+
+          if [ -n "${EXISTING_URL}" ]; then
+            echo "Runner update issue already exists: ${EXISTING_URL}"
+            exit 0
+          fi
+
+          BODY_FILE="${RUNNER_TEMP}/macos-runner-check/issue.md"
+          cat > "${BODY_FILE}" <<EOF
+          GitHub's official runner image list now identifies \
+          \`${CANDIDATE_RUNNER}\` as an Apple Silicon macOS runner without a \
+          preview or deprecated marker.
+
+          Current approved runner: \`${CURRENT_RUNNER}\`
+
+          Official evidence:
+          - https://github.com/actions/runner-images#available-images
+
+          Human review targets:
+          - https://github.com/uchimanajet7/atctl/blob/main/.github/workflows/release.yml
+          - https://github.com/uchimanajet7/homebrew-atctl/blob/main/.github/workflows/ci.yml
+          - https://github.com/uchimanajet7/homebrew-atctl/blob/main/.github/workflows/update-formula-pr.yml
+
+          This issue is a notification only. It does not change a workflow, runner \
+          label, release, Formula, bottle, branch, or pull request. A human decides \
+          whether and when to migrate.
+          EOF
+
+          gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TITLE}" \
+            --body-file "${BODY_FILE}"
