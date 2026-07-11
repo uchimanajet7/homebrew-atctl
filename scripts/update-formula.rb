@@ -89,9 +89,7 @@ class FormulaUpdater
   end
 
   def validate_requirements!(requirements)
-    unless requirements.is_a?(Hash)
-      raise Error, "requirements must be an object with os and arch keys"
-    end
+    raise Error, "requirements must be an object with os and arch keys" unless requirements.is_a?(Hash)
 
     required_keys = %w[os arch]
     missing = required_keys.reject { |key| requirements.key?(key) }
@@ -102,9 +100,7 @@ class FormulaUpdater
 
     os = requirements.fetch("os")
     arch = requirements.fetch("arch")
-    unless OS_REQUIREMENTS.key?(os)
-      raise Error, "unsupported Formula operating system requirement: #{os.inspect}"
-    end
+    raise Error, "unsupported Formula operating system requirement: #{os.inspect}" unless OS_REQUIREMENTS.key?(os)
     return if ARCH_REQUIREMENTS.key?(arch)
 
     raise Error, "unsupported Formula architecture requirement: #{arch.inspect}"
