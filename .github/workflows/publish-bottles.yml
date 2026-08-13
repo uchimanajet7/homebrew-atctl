@@ -40,6 +40,7 @@ jobs:
         run: |
           brew pr-pull --debug \
             --tap="$GITHUB_REPOSITORY" \
+            --workflows=ci.yml \
             --head-sha="$HEAD_SHA" \
             "$PULL_REQUEST"
 
