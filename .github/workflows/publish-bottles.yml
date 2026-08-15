@@ -1,8 +1,15 @@
 name: Publish Bottles
 
-run-name: Publish bottles for PR #${{ inputs.pull_request }} at ${{ inputs.head_sha }}
+run-name: Publish bottles (${{ github.event_name == 'workflow_dispatch' && 'manual' || 'after Formula CI' }})
 
 on:
+  workflow_run:
+    workflows:
+      - Formula CI
+    types:
+      - completed
+    branches:
+      - "formula/**"
   workflow_dispatch:
     inputs:
       pull_request:
@@ -14,24 +21,78 @@ on:
         required: true
         type: string
 
-permissions:
-  actions: read
-  checks: read
-  contents: write
-  issues: read
-  pull-requests: write
+permissions: {}
 
 jobs:
-  publish-bottles:
+  prepare-publication:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.publication.outputs.head_sha }}
+      pull_request: ${{ steps.publication.outputs.pull_request }}
+      should_publish: ${{ steps.publication.outputs.should_publish }}
+      source: ${{ steps.publication.outputs.source }}
 
     steps:
-      - name: Validate publication inputs
+      - name: Resolve and validate publication request
+        id: publication
         env:
-          HEAD_SHA: ${{ inputs.head_sha }}
-          PULL_REQUEST: ${{ inputs.pull_request }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_HEAD_SHA: ${{ inputs.head_sha }}
+          DISPATCH_PULL_REQUEST: ${{ inputs.pull_request }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+
+          if [[ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Publish Bottles must run from the repository default branch ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+          if [[ "${EVENT_NAME}" = "workflow_dispatch" ]]; then
+            SOURCE="manual"
+            PULL_REQUEST="${DISPATCH_PULL_REQUEST}"
+            HEAD_SHA="${DISPATCH_HEAD_SHA}"
+          else
+            SOURCE="automatic"
+
+            if [[ "${WORKFLOW_EVENT}" != "pull_request" || "${WORKFLOW_CONCLUSION}" != "success" ]]; then
+              echo "::error::Automatic publication requires a successful pull_request Formula CI run."
+              exit 1
+            fi
+
+            if [[ "${WORKFLOW_HEAD_REPOSITORY}" != "${GITHUB_REPOSITORY}" ]]; then
+              echo "::error::Automatic publication requires Formula CI to run from ${GITHUB_REPOSITORY}."
+              exit 1
+            fi
+
+            if [[ ! "${WORKFLOW_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Unexpected Formula CI head branch: ${WORKFLOW_HEAD_BRANCH}"
+              exit 1
+            fi
+
+            PULL_REQUEST_COUNT="$(jq -r '.workflow_run.pull_requests | length' "${GITHUB_EVENT_PATH}")"
+            if [[ "${PULL_REQUEST_COUNT}" != "1" ]]; then
+              echo "::error::Formula CI must resolve to exactly one pull request; found ${PULL_REQUEST_COUNT}."
+              exit 1
+            fi
+
+            PULL_REQUEST="$(jq -r '.workflow_run.pull_requests[0].number' "${GITHUB_EVENT_PATH}")"
+            HEAD_SHA="${WORKFLOW_HEAD_SHA}"
+          fi
 
           if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::pull_request must be a positive pull request number without a leading #."
@@ -41,6 +102,230 @@ jobs:
           if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::head_sha must be the full 40-character lowercase Git commit SHA from the reviewed Formula PR."
             exit 1
+          fi
+
+          PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+          PR_HEAD_BRANCH="$(jq -r '.head.ref' <<<"${PR_JSON}")"
+
+          if [[ ! "${PR_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Unexpected pull request head branch: ${PR_HEAD_BRANCH}"
+            exit 1
+          fi
+
+          if ! jq -e \
+            --arg default_branch "${DEFAULT_BRANCH}" \
+            --arg head_sha "${HEAD_SHA}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            '
+              .state == "open" and
+              .draft == false and
+              .base.ref == $default_branch and
+              .head.sha == $head_sha and
+              .head.repo.full_name == $repository and
+              .user.login == "github-actions[bot]"
+            ' <<<"${PR_JSON}" >/dev/null; then
+            echo "::error::The pull request is not the expected open, non-draft, bot-created Formula PR at ${HEAD_SHA}."
+            exit 1
+          fi
+
+          if [[ "${SOURCE}" = "automatic" && "${PR_HEAD_BRANCH}" != "${WORKFLOW_HEAD_BRANCH}" ]]; then
+            echo "::error::Formula CI ran for ${WORKFLOW_HEAD_BRANCH}, but pull request #${PULL_REQUEST} now uses ${PR_HEAD_BRANCH}."
+            exit 1
+          fi
+
+          mapfile -t CHANGED_FILES < <(
+            gh api \
+              --paginate \
+              "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" \
+              --jq '.[].filename'
+          )
+
+          if (( ${#CHANGED_FILES[@]} != 1 )) || [[ "${CHANGED_FILES[0]:-}" != "Formula/atctl.rb" ]]; then
+            echo "::error::Publication requires Formula/atctl.rb to be the pull request's only changed file."
+            printf '::error::Changed file: %s\n' "${CHANGED_FILES[@]}"
+            exit 1
+          fi
+
+          SHOULD_PUBLISH="true"
+          if [[ "${SOURCE}" = "automatic" ]]; then
+            PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
+            TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
+            FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
+            TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
+            FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+
+            if (( TRUE_COUNT > 1 || FALSE_COUNT > 1 || (TRUE_COUNT == 1 && FALSE_COUNT == 1) )); then
+              echo "::error::The Formula PR contains an ambiguous automatic-publication marker."
+              exit 1
+            fi
+
+            if [[ "${TRUE_COUNT}" = "1" ]]; then
+              SHOULD_PUBLISH="true"
+            else
+              SHOULD_PUBLISH="false"
+            fi
+          fi
+
+          if [[ "${SHOULD_PUBLISH}" = "true" ]]; then
+            if ! ENVIRONMENT_JSON="$(
+              gh api "/repos/${GITHUB_REPOSITORY}/environments/homebrew-publication" 2>/dev/null
+            )"; then
+              echo "::error::Create the homebrew-publication environment with uchimanajet7 as a required reviewer before publishing."
+              exit 1
+            fi
+
+            if ! jq -e '
+              any(
+                .protection_rules[]?;
+                .type == "required_reviewers" and
+                .prevent_self_review == false and
+                any(
+                  .reviewers[]?;
+                  .type == "User" and .reviewer.login == "uchimanajet7"
+                )
+              )
+            ' <<<"${ENVIRONMENT_JSON}" >/dev/null; then
+              echo "::error::The homebrew-publication environment must require review by uchimanajet7 and allow self-review for manual runs."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "pull_request=${PULL_REQUEST}"
+            echo "head_sha=${HEAD_SHA}"
+            echo "should_publish=${SHOULD_PUBLISH}"
+            echo "source=${SOURCE}"
+          } >>"${GITHUB_OUTPUT}"
+
+          {
+            echo "## Bottle publication request"
+            echo
+            echo "Pull request: https://github.com/${GITHUB_REPOSITORY}/pull/${PULL_REQUEST}"
+            echo
+            echo "Reviewed head: \`${HEAD_SHA}\`"
+            echo
+            if [[ "${SHOULD_PUBLISH}" = "true" ]]; then
+              echo "Publication source: **${SOURCE}**"
+              echo
+              echo "The publication job will wait for approval in the \`homebrew-publication\` environment."
+            else
+              echo "Automatic bottle publication is disabled for this exact pull request head. No publication approval was requested."
+            fi
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  publish-bottles:
+    needs: prepare-publication
+    if: needs.prepare-publication.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: homebrew-publication
+      url: https://github.com/${{ github.repository }}/pull/${{ needs.prepare-publication.outputs.pull_request }}
+    concurrency:
+      group: homebrew-publication
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      issues: read
+      pull-requests: write
+
+    steps:
+      - name: Revalidate approved publication
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}
+          PUBLICATION_SOURCE: ${{ needs.prepare-publication.outputs.source }}
+          PULL_REQUEST: ${{ needs.prepare-publication.outputs.pull_request }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Publish Bottles must run from the repository default branch ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+          if ! ENVIRONMENT_JSON="$(
+            gh api "/repos/${GITHUB_REPOSITORY}/environments/homebrew-publication" 2>/dev/null
+          )"; then
+            echo "::error::The homebrew-publication environment no longer exists."
+            exit 1
+          fi
+
+          if ! jq -e '
+            any(
+              .protection_rules[]?;
+              .type == "required_reviewers" and
+              .prevent_self_review == false and
+              any(
+                .reviewers[]?;
+                .type == "User" and .reviewer.login == "uchimanajet7"
+              )
+            )
+          ' <<<"${ENVIRONMENT_JSON}" >/dev/null; then
+            echo "::error::The homebrew-publication approval protection changed after preparation."
+            exit 1
+          fi
+
+          if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ || ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The prepared publication identifiers are invalid."
+            exit 1
+          fi
+
+          if [[ "${PUBLICATION_SOURCE}" != "automatic" && "${PUBLICATION_SOURCE}" != "manual" ]]; then
+            echo "::error::Unexpected publication source: ${PUBLICATION_SOURCE}"
+            exit 1
+          fi
+
+          PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+          PR_HEAD_BRANCH="$(jq -r '.head.ref' <<<"${PR_JSON}")"
+
+          if [[ ! "${PR_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Unexpected pull request head branch: ${PR_HEAD_BRANCH}"
+            exit 1
+          fi
+
+          if ! jq -e \
+            --arg default_branch "${DEFAULT_BRANCH}" \
+            --arg head_sha "${HEAD_SHA}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            '
+              .state == "open" and
+              .draft == false and
+              .base.ref == $default_branch and
+              .head.sha == $head_sha and
+              .head.repo.full_name == $repository and
+              .user.login == "github-actions[bot]"
+            ' <<<"${PR_JSON}" >/dev/null; then
+            echo "::error::The approved pull request no longer matches the reviewed Formula PR at ${HEAD_SHA}."
+            exit 1
+          fi
+
+          mapfile -t CHANGED_FILES < <(
+            gh api \
+              --paginate \
+              "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" \
+              --jq '.[].filename'
+          )
+
+          if (( ${#CHANGED_FILES[@]} != 1 )) || [[ "${CHANGED_FILES[0]:-}" != "Formula/atctl.rb" ]]; then
+            echo "::error::Publication requires Formula/atctl.rb to remain the pull request's only changed file."
+            printf '::error::Changed file: %s\n' "${CHANGED_FILES[@]}"
+            exit 1
+          fi
+
+          if [[ "${PUBLICATION_SOURCE}" = "automatic" ]]; then
+            PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
+            TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
+            FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
+            TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
+            FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+
+            if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
+              echo "::error::Automatic bottle publication is no longer enabled for the approved pull request head."
+              exit 1
+            fi
           fi
 
       - name: Set up Homebrew
@@ -54,8 +339,8 @@ jobs:
       - name: Publish reviewed bottles
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          PULL_REQUEST: ${{ inputs.pull_request }}
+          HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}
+          PULL_REQUEST: ${{ needs.prepare-publication.outputs.pull_request }}
         run: |
           brew pr-pull --debug \
             --tap="$GITHUB_REPOSITORY" \

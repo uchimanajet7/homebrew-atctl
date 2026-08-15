@@ -30,33 +30,63 @@ This repository owns the Homebrew tap files for `atctl`:
 
 The main `atctl` source code, product documentation, source releases, and release notes live in [uchimanajet7/atctl](https://github.com/uchimanajet7/atctl).
 
+## One-time Publication Approval Setup
+
+Configure the publication approval before enabling automatic bottle
+publication:
+
+1. Open **Settings → Environments** and create an environment named
+   `homebrew-publication`.
+2. Add `uchimanajet7` as a required reviewer. Keep **Prevent self-review**
+   disabled so the repository owner can also approve a manually dispatched
+   publication.
+
+The workflow reads the current Environment configuration and refuses to request
+or perform publication if the environment, required reviewer, or manual-run
+self-review setting does not match this contract.
+
 ## Release Update Flow
 
 Homebrew publication is separate from the main `atctl` release.
 
 1. Create and review an `atctl` release in the main repository.
-2. Run the `Update Formula PR` workflow in this tap with the release tag.
+2. Run the `Update Formula PR` workflow from `main`. Enter the release tag and
+   leave **Publish bottles after Formula CI succeeds** checked to request bottle
+   publication; the checkbox is checked by default.
 3. Open the generated Formula pull request and review its exact head commit.
 4. If GitHub displays **Approve workflows to run**, approve it and wait for
    **Formula CI** to succeed. This approval only permits CI to run; it does not
    publish bottles or merge the pull request.
-5. To publish bottles, use the pull request's **Bottle publication** section:
-   open its **Publish Bottles** link and copy the displayed `pull_request` and
-   full 40-character `head_sha` values into **Run workflow**.
-6. Do not manually merge the Formula pull request first. A successful
-   **Publish Bottles** run verifies the reviewed head SHA, publishes its bottle
-   artifacts, and pushes the Formula and bottle metadata to `main`.
-7. If the pull request head changes, review the new commit and rerun
-   **Update Formula PR** to refresh the publication values before continuing.
+5. When the checkbox was enabled, a successful **Formula CI** run starts
+   **Publish Bottles** automatically. Open that run, review the pull request and
+   exact head SHA shown for the `homebrew-publication` deployment, then select
+   **Approve and deploy**.
+6. Do not manually merge the Formula pull request first. After approval,
+   **Publish Bottles** revalidates the open PR, current head SHA, changed files,
+   and publication request; it then publishes the bottle artifacts and pushes
+   the Formula and bottle metadata to `main`.
+7. If the pull request head changes before publication, review the new commit,
+   rerun **Update Formula PR**, and approve the new **Formula CI** run. An older
+   pending publication is rejected during post-approval revalidation.
 
-If bottle publication is intentionally not needed, manually merge the reviewed
-Formula pull request after its checks succeed.
+If bottle publication is intentionally not needed, clear the checkbox when
+running **Update Formula PR**. Formula CI still runs, but no publication approval
+is requested and no bottle or `main` update is performed. Manually merge the
+reviewed Formula pull request after its checks succeed.
+
+The separate manual path remains available: open **Publish Bottles**, select
+`main`, copy the `pull_request` number and full 40-character `head_sha` from the
+generated PR's **Bottle publication** section, and run the workflow. Manual
+publication uses the same `homebrew-publication` approval and post-approval
+validation.
 
 This follows Homebrew's tap-maintenance flow: review the pull request and its
 checks, then run `brew pr-pull` with the reviewed head SHA so publication fails
 safely if the pull request changed.
 
 - [Homebrew: How to Create and Maintain a Tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
+- [GitHub: Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+- [GitHub: Reviewing deployments](https://docs.github.com/en/actions/how-tos/managing-workflow-runs-and-deployments/managing-deployments/reviewing-deployments)
 
 ## License
 

@@ -7,6 +7,11 @@ on:
         description: "Release tag from uchimanajet7/atctl, for example v0.1.0"
         required: true
         type: string
+      publish_bottles:
+        description: "Publish bottles after Formula CI succeeds"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -44,30 +49,23 @@ jobs:
       - name: Create or update formula pull request
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLISH_BOTTLES: ${{ inputs.publish_bottles }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
-          if [ -z "$(git status --short -- Formula/atctl.rb)" ]; then
-            echo "Formula/atctl.rb is already up to date for ${RELEASE_TAG}."
-            exit 0
-          fi
+          case "${PUBLISH_BOTTLES}" in
+            true|false)
+              ;;
+            *)
+              echo "::error::publish_bottles must be true or false."
+              exit 1
+              ;;
+          esac
 
           SAFE_TAG="${RELEASE_TAG//[^A-Za-z0-9._-]/-}"
           BRANCH="formula/${SAFE_TAG}"
           REMOTE_BRANCH_REF="refs/heads/${BRANCH}"
-
-          git checkout -B "${BRANCH}"
-          git add Formula/atctl.rb
-          git commit -m "Update atctl formula to ${RELEASE_TAG}"
-          REMOTE_BRANCH_SHA="$(
-            git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
-              awk 'NR == 1 { print $1 }'
-          )"
-          git push \
-            --force-with-lease="${REMOTE_BRANCH_REF}:${REMOTE_BRANCH_SHA}" \
-            origin \
-            "${BRANCH}:${REMOTE_BRANCH_REF}"
 
           PR_COUNT="$(
             gh pr list \
@@ -78,6 +76,27 @@ jobs:
               --json number \
               --jq 'length'
           )"
+
+          if [ -n "$(git status --short -- Formula/atctl.rb)" ]; then
+            git checkout -B "${BRANCH}"
+            git add Formula/atctl.rb
+            git commit -m "Update atctl formula to ${RELEASE_TAG}"
+            REMOTE_BRANCH_SHA="$(
+              git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+                awk 'NR == 1 { print $1 }'
+            )"
+            git push \
+              --force-with-lease="${REMOTE_BRANCH_REF}:${REMOTE_BRANCH_SHA}" \
+              origin \
+              "${BRANCH}:${REMOTE_BRANCH_REF}"
+          elif [ "${PR_COUNT}" -eq 0 ]; then
+            {
+              echo "## Formula update"
+              echo
+              echo "\`Formula/atctl.rb\` is already up to date for ${RELEASE_TAG}; no open ${BRANCH} pull request requires synchronization."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
 
           case "${PR_COUNT}" in
             0)
@@ -124,23 +143,38 @@ jobs:
           PR_BODY_FILE="$(mktemp)"
           trap 'rm -f "${HANDOFF_FILE}" "${PR_BODY_FILE}"' EXIT
 
-          cat >"${HANDOFF_FILE}" <<EOF
-          ## Bottle publication
-
-          Review this exact pull request head and confirm that **Formula CI** succeeds before publishing bottles.
-
-          | Publish Bottles input | Value |
-          | --- | --- |
-          | \`pull_request\` | \`${PR_NUMBER}\` |
-          | \`head_sha\` | \`${PR_HEAD_SHA}\` |
-
-          1. If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request.
-          2. Open [Publish Bottles](${PUBLISH_URL}).
-          3. Select **Run workflow**, enter the two values above exactly, and start the workflow.
-          4. Do not manually merge this pull request before bottle publication. A successful **Publish Bottles** run integrates the reviewed Formula and bottle metadata into \`main\`.
-
-          If the pull request head changes, review the new commit and rerun **Update Formula PR** to refresh this handoff. The publication workflow rejects a different head through \`brew pr-pull --head-sha\`.
-          EOF
+          {
+            echo "## Bottle publication"
+            echo
+            if [ "${PUBLISH_BOTTLES}" = "true" ]; then
+              echo "Automatic bottle publication: **Enabled**"
+              echo
+              echo "After **Formula CI** succeeds for this exact head, **Publish Bottles** starts automatically and waits for approval in the \`homebrew-publication\` environment. Review that deployment and select **Approve and deploy** to publish the bottles and update \`main\`."
+              echo
+              echo "Do not manually merge this pull request before bottle publication."
+            else
+              echo "Automatic bottle publication: **Disabled**"
+              echo
+              echo "After **Formula CI** succeeds, no automatic publication approval is requested and no bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
+            fi
+            echo
+            echo "If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request."
+            echo
+            echo "### Manual Publish Bottles inputs"
+            echo
+            echo "The manual workflow remains available independently of the automatic setting. It uses the same publication approval and exact-head validation."
+            echo
+            echo "| Publish Bottles input | Value |"
+            echo "| --- | --- |"
+            echo "| \`pull_request\` | \`${PR_NUMBER}\` |"
+            echo "| \`head_sha\` | \`${PR_HEAD_SHA}\` |"
+            echo
+            echo "[Open Publish Bottles](${PUBLISH_URL})"
+            echo
+            echo "If the pull request head changes, review the new commit and rerun **Update Formula PR** to refresh this handoff. Publication is rejected unless the current pull request head and the reviewed \`brew pr-pull --head-sha\` value still match."
+            echo
+            echo "<!-- homebrew-atctl-publish-bottles=${PUBLISH_BOTTLES} head_sha=${PR_HEAD_SHA} -->"
+          } >"${HANDOFF_FILE}"
 
           {
             echo "Updates \`Formula/atctl.rb\` for [uchimanajet7/atctl ${RELEASE_TAG}](https://github.com/uchimanajet7/atctl/releases/tag/${RELEASE_TAG}) using \`scripts/update-formula.rb\`."
