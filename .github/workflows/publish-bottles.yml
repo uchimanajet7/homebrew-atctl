@@ -1,14 +1,16 @@
 name: Publish Bottles
 
+run-name: Publish bottles for PR #${{ inputs.pull_request }} at ${{ inputs.head_sha }}
+
 on:
   workflow_dispatch:
     inputs:
       pull_request:
-        description: "Reviewed pull request number whose bottle artifacts should be published"
+        description: "PR number shown in the generated Formula PR's Bottle publication section"
         required: true
         type: string
       head_sha:
-        description: "Expected reviewed pull request head commit SHA"
+        description: "Full 40-character head SHA shown in that reviewed PR section"
         required: true
         type: string
 
@@ -24,6 +26,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate publication inputs
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pull_request must be a positive pull request number without a leading #."
+            exit 1
+          fi
+
+          if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::head_sha must be the full 40-character lowercase Git commit SHA from the reviewed Formula PR."
+            exit 1
+          fi
+
       - name: Set up Homebrew
         uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
         with:

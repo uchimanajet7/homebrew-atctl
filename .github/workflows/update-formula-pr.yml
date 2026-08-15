@@ -41,7 +41,7 @@ jobs:
       - name: Audit formula
         run: brew audit --strict --online atctl
 
-      - name: Create formula update pull request
+      - name: Create or update formula pull request
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
@@ -55,13 +55,105 @@ jobs:
 
           SAFE_TAG="${RELEASE_TAG//[^A-Za-z0-9._-]/-}"
           BRANCH="formula/${SAFE_TAG}"
+          REMOTE_BRANCH_REF="refs/heads/${BRANCH}"
 
           git checkout -B "${BRANCH}"
           git add Formula/atctl.rb
           git commit -m "Update atctl formula to ${RELEASE_TAG}"
-          git push --force-with-lease origin "${BRANCH}"
-          gh pr create \
-            --base "${GITHUB_REF_NAME}" \
-            --head "${BRANCH}" \
-            --title "Update atctl formula to ${RELEASE_TAG}" \
-            --body "Updates Formula/atctl.rb for uchimanajet7/atctl ${RELEASE_TAG} using scripts/update-formula.rb."
+          REMOTE_BRANCH_SHA="$(
+            git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          git push \
+            --force-with-lease="${REMOTE_BRANCH_REF}:${REMOTE_BRANCH_SHA}" \
+            origin \
+            "${BRANCH}:${REMOTE_BRANCH_REF}"
+
+          PR_COUNT="$(
+            gh pr list \
+              --state open \
+              --base "${GITHUB_REF_NAME}" \
+              --head "${BRANCH}" \
+              --limit 2 \
+              --json number \
+              --jq 'length'
+          )"
+
+          case "${PR_COUNT}" in
+            0)
+              PR_URL="$(
+                gh pr create \
+                  --base "${GITHUB_REF_NAME}" \
+                  --head "${BRANCH}" \
+                  --title "Update atctl formula to ${RELEASE_TAG}" \
+                  --body "Updates Formula/atctl.rb for uchimanajet7/atctl ${RELEASE_TAG} using scripts/update-formula.rb."
+              )"
+              ;;
+            1)
+              PR_URL="$(
+                gh pr list \
+                  --state open \
+                  --base "${GITHUB_REF_NAME}" \
+                  --head "${BRANCH}" \
+                  --limit 1 \
+                  --json url \
+                  --jq '.[0].url'
+              )"
+              ;;
+            *)
+              echo "::error::Found ${PR_COUNT} open pull requests for ${BRANCH}; expected at most one."
+              exit 1
+              ;;
+          esac
+
+          PR_NUMBER="$(gh pr view "${PR_URL}" --json number --jq '.number')"
+          PR_HEAD_SHA="$(gh pr view "${PR_URL}" --json headRefOid --jq '.headRefOid')"
+
+          if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::GitHub returned an invalid pull request number: ${PR_NUMBER}"
+            exit 1
+          fi
+
+          if [[ ! "${PR_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::GitHub returned an invalid pull request head SHA: ${PR_HEAD_SHA}"
+            exit 1
+          fi
+
+          PUBLISH_URL="https://github.com/${GITHUB_REPOSITORY}/actions/workflows/publish-bottles.yml"
+          HANDOFF_FILE="$(mktemp)"
+          PR_BODY_FILE="$(mktemp)"
+          trap 'rm -f "${HANDOFF_FILE}" "${PR_BODY_FILE}"' EXIT
+
+          cat >"${HANDOFF_FILE}" <<EOF
+          ## Bottle publication
+
+          Review this exact pull request head and confirm that **Formula CI** succeeds before publishing bottles.
+
+          | Publish Bottles input | Value |
+          | --- | --- |
+          | \`pull_request\` | \`${PR_NUMBER}\` |
+          | \`head_sha\` | \`${PR_HEAD_SHA}\` |
+
+          1. If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request.
+          2. Open [Publish Bottles](${PUBLISH_URL}).
+          3. Select **Run workflow**, enter the two values above exactly, and start the workflow.
+          4. Do not manually merge this pull request before bottle publication. A successful **Publish Bottles** run integrates the reviewed Formula and bottle metadata into \`main\`.
+
+          If the pull request head changes, review the new commit and rerun **Update Formula PR** to refresh this handoff. The publication workflow rejects a different head through \`brew pr-pull --head-sha\`.
+          EOF
+
+          {
+            echo "Updates \`Formula/atctl.rb\` for [uchimanajet7/atctl ${RELEASE_TAG}](https://github.com/uchimanajet7/atctl/releases/tag/${RELEASE_TAG}) using \`scripts/update-formula.rb\`."
+            echo
+            cat "${HANDOFF_FILE}"
+          } >"${PR_BODY_FILE}"
+
+          gh pr edit "${PR_URL}" --body-file "${PR_BODY_FILE}"
+
+          {
+            echo "## Formula update pull request"
+            echo
+            echo "Pull request: ${PR_URL}"
+            echo
+            cat "${HANDOFF_FILE}"
+          } >>"${GITHUB_STEP_SUMMARY}"
