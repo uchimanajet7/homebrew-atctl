@@ -194,5 +194,5 @@ jobs:
             echo
             echo "Requested **Publish Bottles** for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
             echo
-            echo "That workflow will record whether publication is disabled, waiting for approval, or ready to publish."
+            echo "That workflow will stop successfully when publication is disabled, or publish automatically when it is enabled."
           } >>"${GITHUB_STEP_SUMMARY}"

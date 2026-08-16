@@ -1,13 +1,10 @@
 name: Publish Bottles
 
 run-name: >-
-  Bottle publication for PR #${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event_name == 'pull_request_review' && github.event.pull_request.number || github.event.client_payload.pull_request || github.run_id }}
-  (${{ github.event_name == 'workflow_dispatch' && 'manual publication' || github.event_name == 'pull_request_review' && 'PR approval decision request' || 'publication decision' }})
+  Bottle publication for PR #${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event.client_payload.pull_request || github.run_id }}
+  (${{ github.event_name == 'workflow_dispatch' && 'manual publication' || 'automatic publication' }})
 
 on:
-  pull_request_review:
-    types:
-      - submitted
   repository_dispatch:
     types:
       - evaluate-bottle-publication
@@ -18,98 +15,20 @@ on:
         required: true
         type: string
       head_sha:
-        description: "Full 40-character head SHA shown in that reviewed PR section"
+        description: "Full 40-character head SHA shown in that Formula PR section"
         required: true
         type: string
 
 concurrency:
   group: >-
-    bottle-publication-pr-${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event_name == 'pull_request_review' && github.event.pull_request.number || github.event.client_payload.pull_request || github.run_id }}
+    bottle-publication-pr-${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event.client_payload.pull_request || github.run_id }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  request-publication-decision:
-    name: Start publication decision
-    if: >-
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved' &&
-      github.event.review.user.login == github.repository_owner
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Dispatch approval decision
-        env:
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GH_TOKEN: ${{ github.token }}
-          PULL_REQUEST: ${{ github.event.pull_request.number }}
-          PULL_REQUEST_AUTHOR: ${{ github.event.pull_request.user.login }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
-          REVIEW_COMMIT_ID: ${{ github.event.review.commit_id }}
-          REVIEW_ID: ${{ github.event.review.id }}
-          REVIEW_STATE: ${{ github.event.review.state }}
-          REVIEWER: ${{ github.event.review.user.login }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${REVIEW_STATE}" != "approved" || "${REVIEWER}" != "${REPOSITORY_OWNER}" ]]; then
-            echo "::error::The decision request requires an approving review from ${REPOSITORY_OWNER}."
-            exit 1
-          fi
-
-          if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ || ! "${REVIEW_ID}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::The approval event did not contain valid pull request and review IDs."
-            exit 1
-          fi
-
-          if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ || "${REVIEW_COMMIT_ID}" != "${HEAD_SHA}" ]]; then
-            echo "::error::The approval does not identify the current full Formula pull request head SHA."
-            exit 1
-          fi
-
-          if [[ "${PULL_REQUEST_AUTHOR}" != "github-actions[bot]" ||
-            "${HEAD_REPOSITORY}" != "${GITHUB_REPOSITORY}" ||
-            ! "${HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::The approval is not for a bot-created Formula branch in ${GITHUB_REPOSITORY}."
-            exit 1
-          fi
-
-          DISPATCH_PAYLOAD="$(
-            jq -cn \
-              --arg head_sha "${HEAD_SHA}" \
-              --argjson pull_request "${PULL_REQUEST}" \
-              --argjson review_id "${REVIEW_ID}" \
-              '{
-                event_type: "evaluate-bottle-publication",
-                client_payload: {
-                  pull_request: $pull_request,
-                  head_sha: $head_sha,
-                  review_id: $review_id
-                }
-              }'
-          )"
-
-          gh api \
-            --method POST \
-            "/repos/${GITHUB_REPOSITORY}/dispatches" \
-            --input - <<<"${DISPATCH_PAYLOAD}"
-
-          {
-            echo "## Bottle publication approval"
-            echo
-            echo "Requested a default-branch publication decision for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
-            echo
-            echo "The decision run will publish only if Formula CI has succeeded and this remains the current repository-owner approval."
-          } >>"${GITHUB_STEP_SUMMARY}"
-
   prepare-publication:
     name: Decide bottle publication
-    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -120,7 +39,6 @@ jobs:
       head_sha: ${{ steps.publication.outputs.head_sha }}
       pull_request: ${{ steps.publication.outputs.pull_request }}
       ready: ${{ steps.publication.outputs.ready }}
-      review_id: ${{ steps.publication.outputs.review_id }}
       source: ${{ steps.publication.outputs.source }}
 
     steps:
@@ -136,8 +54,6 @@ jobs:
           REPOSITORY_DISPATCH_ACTION: ${{ github.event.action }}
           REPOSITORY_DISPATCH_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           REPOSITORY_DISPATCH_PULL_REQUEST: ${{ github.event.client_payload.pull_request }}
-          REPOSITORY_DISPATCH_REVIEW_ID: ${{ github.event.client_payload.review_id }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
@@ -152,13 +68,11 @@ jobs:
             PULL_REQUEST="${DISPATCH_PULL_REQUEST}"
             HEAD_SHA="${DISPATCH_HEAD_SHA}"
             FORMULA_CI_RUN_ID=""
-            REVIEW_ID=""
           elif [[ "${EVENT_NAME}" = "repository_dispatch" ]]; then
             SOURCE="automatic"
             REQUEST_KIND="${REPOSITORY_DISPATCH_ACTION}"
             PULL_REQUEST="${REPOSITORY_DISPATCH_PULL_REQUEST}"
             HEAD_SHA="${REPOSITORY_DISPATCH_HEAD_SHA}"
-            REVIEW_ID="${REPOSITORY_DISPATCH_REVIEW_ID}"
 
             if [[ "${REQUEST_KIND}" != "evaluate-bottle-publication" ]]; then
               echo "::error::Unexpected repository_dispatch action: ${REPOSITORY_DISPATCH_ACTION}"
@@ -175,7 +89,6 @@ jobs:
               echo "head_sha=${HEAD_SHA}"
               echo "pull_request=${PULL_REQUEST}"
               echo "ready=${READY}"
-              echo "review_id=${REVIEW_ID}"
               echo "source=${SOURCE}"
             } >>"${GITHUB_OUTPUT}"
           }
@@ -188,23 +101,13 @@ jobs:
           fi
 
           if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::head_sha must be the full 40-character lowercase Git commit SHA from the reviewed Formula PR."
+            echo "::error::head_sha must be the full 40-character lowercase Git commit SHA from the Formula PR."
             exit 1
           fi
 
           if [[ "${SOURCE}" = "automatic" ]]; then
-            if [[ -n "${FORMULA_CI_RUN_ID}" && ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::The automatic publication decision contains an invalid Formula CI run ID."
-              exit 1
-            fi
-
-            if [[ -n "${REVIEW_ID}" && ! "${REVIEW_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::The automatic publication decision contains an invalid review ID."
-              exit 1
-            fi
-
-            if [[ -z "${FORMULA_CI_RUN_ID}" && -z "${REVIEW_ID}" ]]; then
-              echo "::error::The automatic publication decision must identify either Formula CI or an approving review."
+            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::The automatic publication decision must identify a valid Formula CI run."
               exit 1
             fi
           fi
@@ -292,72 +195,6 @@ jobs:
           fi
 
           if [[ "${SOURCE}" = "automatic" ]]; then
-            if [[ -z "${FORMULA_CI_RUN_ID}" ]]; then
-              FORMULA_CI_RUN_READY="false"
-              for _ in {1..30}; do
-                CI_RUNS_JSON="$(
-                  gh api \
-                    --method GET \
-                    "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
-                    -f event=pull_request \
-                    -f head_sha="${HEAD_SHA}" \
-                    -f status=success \
-                    -F per_page=100
-                )"
-                FORMULA_CI_RUN_ID="$(
-                  jq -r \
-                    --arg head_branch "${PR_HEAD_BRANCH}" \
-                    --arg head_sha "${HEAD_SHA}" \
-                    --arg repository "${GITHUB_REPOSITORY}" \
-                    --argjson pull_request "${PULL_REQUEST}" \
-                    '
-                      [
-                        .workflow_runs[]?
-                        | select(
-                            .name == "Formula CI" and
-                            ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
-                            .event == "pull_request" and
-                            .status == "completed" and
-                            .conclusion == "success" and
-                            .head_branch == $head_branch and
-                            .head_sha == $head_sha and
-                            .head_repository.full_name == $repository and
-                            .actor.login == "github-actions[bot]" and
-                            any(.pull_requests[]?; .number == $pull_request)
-                          )
-                      ]
-                      | sort_by(.updated_at)
-                      | last
-                      | .id // empty
-                    ' <<<"${CI_RUNS_JSON}"
-                )"
-
-                if [[ -n "${FORMULA_CI_RUN_ID}" ]]; then
-                  FORMULA_CI_RUN_READY="true"
-                  break
-                fi
-
-                sleep 2
-              done
-
-              if [[ "${FORMULA_CI_RUN_READY}" != "true" ]]; then
-                write_outputs
-                {
-                  echo "## Bottle publication: waiting for Formula CI"
-                  echo
-                  echo "Pull request #${PULL_REQUEST} is approved at \`${HEAD_SHA}\`."
-                  echo
-                  echo "Formula CI has not succeeded for this exact head. Its final decision job will re-evaluate publication after CI succeeds."
-                } >>"${GITHUB_STEP_SUMMARY}"
-                exit 0
-              fi
-            fi
-
-            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::GitHub returned an invalid Formula CI run ID: ${FORMULA_CI_RUN_ID}"
-              exit 1
-            fi
-
             CI_RUN_READY="false"
             for _ in {1..30}; do
               CI_RUN_JSON="$(
@@ -440,113 +277,6 @@ jobs:
               exit 0
             fi
 
-            REVIEW_CONVERGED="false"
-            for _ in {1..30}; do
-              REVIEWS_JSON="$(
-                gh api \
-                  --paginate \
-                  --slurp \
-                  "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/reviews?per_page=100"
-              )"
-              LATEST_OWNER_REVIEW="$(
-                jq -c \
-                  --arg repository_owner "${REPOSITORY_OWNER}" \
-                  '
-                    [
-                      .[][]
-                      | select(
-                          .user.login == $repository_owner and
-                          .state != "COMMENTED"
-                        )
-                    ]
-                    | sort_by(.submitted_at, .id)
-                    | last // {}
-                  ' <<<"${REVIEWS_JSON}"
-              )"
-
-              if [[ -z "${REVIEW_ID}" ]] || jq -e \
-                --argjson review_id "${REVIEW_ID:-0}" \
-                '.id == $review_id' <<<"${LATEST_OWNER_REVIEW}" >/dev/null; then
-                REVIEW_CONVERGED="true"
-                break
-              fi
-
-              sleep 2
-            done
-
-            if [[ "${REVIEW_CONVERGED}" != "true" ]]; then
-              write_outputs
-              {
-                echo "## Bottle publication: stale approval"
-                echo
-                echo "Approval ${REVIEW_ID} did not become the repository owner's current decision for \`${HEAD_SHA}\`."
-                echo
-                echo "No publication was performed by this stale decision request."
-              } >>"${GITHUB_STEP_SUMMARY}"
-              exit 0
-            fi
-
-            if ! jq -e \
-              --arg head_sha "${HEAD_SHA}" \
-              --arg repository_owner "${REPOSITORY_OWNER}" \
-              '
-                .state == "APPROVED" and
-                .commit_id == $head_sha and
-                .user.login == $repository_owner and
-                (.id | type == "number")
-              ' <<<"${LATEST_OWNER_REVIEW}" >/dev/null; then
-              write_outputs
-              {
-                echo "## Bottle publication: waiting for approval"
-                echo
-                echo "Formula CI succeeded for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
-                echo
-                echo "Automatic publication is enabled. Approve this exact pull request head to publish the bottles and update \`main\`."
-              } >>"${GITHUB_STEP_SUMMARY}"
-              exit 0
-            fi
-
-            LATEST_REVIEW_ID="$(jq -r '.id' <<<"${LATEST_OWNER_REVIEW}")"
-
-            if [[ -n "${REVIEW_ID}" && "${REVIEW_ID}" != "${LATEST_REVIEW_ID}" ]]; then
-              write_outputs
-              {
-                echo "## Bottle publication: stale approval"
-                echo
-                echo "A newer repository-owner review superseded approval ${REVIEW_ID} for \`${HEAD_SHA}\`."
-                echo
-                echo "No publication was performed by this stale decision request."
-              } >>"${GITHUB_STEP_SUMMARY}"
-              exit 0
-            fi
-
-            REVIEW_ID="${LATEST_REVIEW_ID}"
-
-            if [[ ! "${REVIEW_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::GitHub did not return a valid approving review ID for ${HEAD_SHA}."
-              exit 1
-            fi
-
-            APPROVAL_JSON="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/reviews/${REVIEW_ID}"
-            )"
-
-            for REVIEW_JSON in "${APPROVAL_JSON}" "${LATEST_OWNER_REVIEW}"; do
-              if ! jq -e \
-                --arg head_sha "${HEAD_SHA}" \
-                --arg repository_owner "${REPOSITORY_OWNER}" \
-                --argjson review_id "${REVIEW_ID}" \
-                '
-                  .id == $review_id and
-                  .state == "APPROVED" and
-                  .commit_id == $head_sha and
-                  .user.login == $repository_owner
-                ' <<<"${REVIEW_JSON}" >/dev/null; then
-                echo "::error::Review ${REVIEW_ID} is not the repository owner's latest approval for ${HEAD_SHA}."
-                exit 1
-              fi
-            done
-
             ARTIFACT_READY="false"
             for _ in {1..15}; do
               ARTIFACTS_JSON="$(
@@ -585,14 +315,12 @@ jobs:
             echo
             echo "Pull request: https://github.com/${GITHUB_REPOSITORY}/pull/${PULL_REQUEST}"
             echo
-            echo "Reviewed head: \`${HEAD_SHA}\`"
+            echo "Formula head: \`${HEAD_SHA}\`"
             echo
             echo "Publication source: **${SOURCE}**"
             if [[ "${SOURCE}" = "automatic" ]]; then
               echo
               echo "Formula CI run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
-              echo
-              echo "Approval: https://github.com/${GITHUB_REPOSITORY}/pull/${PULL_REQUEST}#pullrequestreview-${REVIEW_ID}"
             fi
           } >>"${GITHUB_STEP_SUMMARY}"
 
@@ -619,8 +347,6 @@ jobs:
           HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}
           PUBLICATION_SOURCE: ${{ needs.prepare-publication.outputs.source }}
           PULL_REQUEST: ${{ needs.prepare-publication.outputs.pull_request }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
-          REVIEW_ID: ${{ needs.prepare-publication.outputs.review_id }}
         run: |
           set -euo pipefail
 
@@ -659,7 +385,7 @@ jobs:
               .head.repo.full_name == $repository and
               .user.login == "github-actions[bot]"
             ' <<<"${PR_JSON}" >/dev/null; then
-            echo "::error::The pull request no longer matches the reviewed Formula PR at ${HEAD_SHA}."
+            echo "::error::The pull request no longer matches the Formula PR at ${HEAD_SHA}."
             exit 1
           fi
 
@@ -677,8 +403,8 @@ jobs:
           fi
 
           if [[ "${PUBLICATION_SOURCE}" = "automatic" ]]; then
-            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ || ! "${REVIEW_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::Automatic publication lost its Formula CI or approval identifier."
+            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::Automatic publication lost its Formula CI run identifier."
               exit 1
             fi
 
@@ -689,50 +415,9 @@ jobs:
             FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
 
             if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
-              echo "::error::Automatic bottle publication is no longer enabled for the approved pull request head."
+              echo "::error::Automatic bottle publication is no longer enabled for the Formula pull request head."
               exit 1
             fi
-
-            APPROVAL_JSON="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/reviews/${REVIEW_ID}"
-            )"
-            REVIEWS_JSON="$(
-              gh api \
-                --paginate \
-                --slurp \
-                "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/reviews?per_page=100"
-            )"
-            LATEST_OWNER_REVIEW="$(
-              jq -c \
-                --arg repository_owner "${REPOSITORY_OWNER}" \
-                '
-                  [
-                    .[][]
-                    | select(
-                        .user.login == $repository_owner and
-                        .state != "COMMENTED"
-                      )
-                  ]
-                  | sort_by(.submitted_at, .id)
-                  | last // {}
-                ' <<<"${REVIEWS_JSON}"
-            )"
-
-            for REVIEW_JSON in "${APPROVAL_JSON}" "${LATEST_OWNER_REVIEW}"; do
-              if ! jq -e \
-                --arg head_sha "${HEAD_SHA}" \
-                --arg repository_owner "${REPOSITORY_OWNER}" \
-                --argjson review_id "${REVIEW_ID}" \
-                '
-                  .id == $review_id and
-                  .state == "APPROVED" and
-                  .commit_id == $head_sha and
-                  .user.login == $repository_owner
-                ' <<<"${REVIEW_JSON}" >/dev/null; then
-                echo "::error::The repository owner's approval is no longer valid for ${HEAD_SHA}."
-                exit 1
-              fi
-            done
 
             CI_RUN_JSON="$(
               gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
@@ -755,7 +440,7 @@ jobs:
                 .actor.login == "github-actions[bot]" and
                 any(.pull_requests[]?; .number == $pull_request)
               ' <<<"${CI_RUN_JSON}" >/dev/null; then
-              echo "::error::The approved Formula CI run is no longer valid for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
+              echo "::error::The Formula CI run is no longer valid for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
               exit 1
             fi
 
@@ -774,7 +459,7 @@ jobs:
                   .workflow_run.head_sha == $head_sha
                 )
               ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
-              echo "::error::The approved Formula CI bottles are no longer available for ${HEAD_SHA}."
+              echo "::error::The Formula CI bottles are no longer available for ${HEAD_SHA}."
               exit 1
             fi
           fi
@@ -787,7 +472,7 @@ jobs:
       - name: Set up Git author
         uses: Homebrew/actions/git-user-config@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
 
-      - name: Publish reviewed bottles
+      - name: Publish bottles
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}

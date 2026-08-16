@@ -291,9 +291,11 @@ jobs:
             if [ "${PUBLISH_BOTTLES}" = "true" ]; then
               echo "Automatic bottle publication: **Enabled**"
               echo
-              echo "After **Formula CI** succeeds, it starts a **Publish Bottles** decision run. Once this exact head also has one approving pull request review, regardless of order, **Publish Bottles** publishes the bottles and updates \`main\`."
+              echo "After **Formula CI** succeeds, it starts **Publish Bottles**. That workflow validates this exact head and bottle artifact, publishes the bottles, and updates \`main\` automatically."
               echo
-              echo "If this exact head is already approved and already passed **Formula CI**, rerunning **Update Formula PR** with this setting enabled reuses that approval and successful CI run and starts **Publish Bottles** immediately."
+              echo "If this exact head already passed **Formula CI**, rerunning **Update Formula PR** with this setting enabled reuses that successful CI run and starts publication immediately."
+              echo
+              echo "No pull request review, deployment approval, manual **Publish Bottles** run, or manual merge is required."
               echo
               echo "Do not manually merge this pull request before bottle publication."
             else
@@ -302,11 +304,11 @@ jobs:
               echo "After **Formula CI** succeeds, **Publish Bottles** runs its decision job, records that publication is disabled, and completes successfully. Its publishing job is skipped, so no bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
             fi
             echo
-            echo "If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request."
+            echo "If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. No pull request review or deployment approval follows."
             echo
             echo "### Manual Publish Bottles inputs"
             echo
-            echo "The manual workflow remains available independently of the automatic setting. Explicitly running it starts publication after exact-head validation without a separate approval step."
+            echo "The optional manual workflow remains available independently of the automatic setting. Explicitly running it starts publication after exact-head validation."
             echo
             echo "| Publish Bottles input | Value |"
             echo "| --- | --- |"
@@ -315,7 +317,7 @@ jobs:
             echo
             echo "[Open Publish Bottles](${PUBLISH_URL})"
             echo
-            echo "If the pull request head changes, review the new commit and rerun **Update Formula PR** to refresh this handoff. Publication is rejected unless the current pull request head and the reviewed \`brew pr-pull --head-sha\` value still match."
+            echo "If the pull request head changes, inspect the new commit and rerun **Update Formula PR** to refresh this handoff. Publication is rejected unless the current pull request head and the validated \`brew pr-pull --head-sha\` value still match."
             echo
             echo "<!-- homebrew-atctl-publish-bottles=${PUBLISH_BOTTLES} head_sha=${PR_HEAD_SHA} -->"
           } >"${HANDOFF_FILE}"
