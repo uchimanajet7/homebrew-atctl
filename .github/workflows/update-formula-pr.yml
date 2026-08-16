@@ -53,6 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PUBLISH_BOTTLES: ${{ inputs.publish_bottles }}
           RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
@@ -291,22 +292,22 @@ jobs:
             if [ "${PUBLISH_BOTTLES}" = "true" ]; then
               echo "Automatic bottle publication: **Enabled**"
               echo
-              echo "After **Formula CI** succeeds for this exact head, it explicitly requests **Publish Bottles**, which waits for approval in the \`homebrew-publication\` environment. Review that deployment and select **Approve and deploy** to publish the bottles and update \`main\`."
+              echo "Once this exact head has both a successful **Formula CI** run and one approving pull request review, regardless of order, **Publish Bottles** starts automatically, publishes the bottles, and updates \`main\`."
               echo
-              echo "If this exact head already passed **Formula CI** while publication was disabled, rerunning **Update Formula PR** with this setting enabled reuses that successful CI run and requests **Publish Bottles** immediately."
+              echo "If this exact head is already approved and already passed **Formula CI**, rerunning **Update Formula PR** with this setting enabled reuses that approval and successful CI run and starts **Publish Bottles** immediately."
               echo
               echo "Do not manually merge this pull request before bottle publication."
             else
               echo "Automatic bottle publication: **Disabled**"
               echo
-              echo "After **Formula CI** succeeds, it does not start **Publish Bottles**. No publication approval is requested and no bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
+              echo "After **Formula CI** succeeds, approving this pull request does not start **Publish Bottles**. No bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
             fi
             echo
             echo "If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request."
             echo
             echo "### Manual Publish Bottles inputs"
             echo
-            echo "The manual workflow remains available independently of the automatic setting. It uses the same publication approval and exact-head validation."
+            echo "The manual workflow remains available independently of the automatic setting. Explicitly running it starts publication after exact-head validation without a separate approval step."
             echo
             echo "| Publish Bottles input | Value |"
             echo "| --- | --- |"
@@ -422,26 +423,68 @@ jobs:
                 exit 1
               fi
 
-              DISPATCH_PAYLOAD="$(
-                jq -cn \
-                  --arg head_sha "${PR_HEAD_SHA}" \
-                  --argjson formula_ci_run_id "${FORMULA_CI_RUN_ID}" \
-                  --argjson pull_request "${PR_NUMBER}" \
-                  '{
-                    event_type: "publish-bottles",
-                    client_payload: {
-                      pull_request: $pull_request,
-                      head_sha: $head_sha,
-                      formula_ci_run_id: $formula_ci_run_id
-                    }
-                  }'
+              REVIEWS_JSON="$(
+                gh api \
+                  --paginate \
+                  --slurp \
+                  "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100"
+              )"
+              APPROVAL_JSON="$(
+                jq -c \
+                  --arg repository_owner "${REPOSITORY_OWNER}" \
+                  '
+                    [
+                      .[][]
+                      | select(
+                          .user.login == $repository_owner and
+                          .state != "COMMENTED"
+                        )
+                    ]
+                    | last // {}
+                  ' <<<"${REVIEWS_JSON}"
               )"
 
-              gh api \
-                --method POST \
-                "/repos/${GITHUB_REPOSITORY}/dispatches" \
-                --input - <<<"${DISPATCH_PAYLOAD}"
-              CATCH_UP_STATUS="requested"
+              if ! jq -e \
+                --arg head_sha "${PR_HEAD_SHA}" \
+                --arg repository_owner "${REPOSITORY_OWNER}" \
+                '
+                  .state == "APPROVED" and
+                  .commit_id == $head_sha and
+                  .user.login == $repository_owner and
+                  (.id | type == "number")
+                ' <<<"${APPROVAL_JSON}" >/dev/null; then
+                CATCH_UP_STATUS="approval-required"
+              else
+                APPROVAL_ID="$(jq -r '.id' <<<"${APPROVAL_JSON}")"
+
+                if [[ ! "${APPROVAL_ID}" =~ ^[1-9][0-9]*$ ]]; then
+                  echo "::error::GitHub returned an invalid approval review ID: ${APPROVAL_ID}"
+                  exit 1
+                fi
+
+                DISPATCH_PAYLOAD="$(
+                  jq -cn \
+                    --arg head_sha "${PR_HEAD_SHA}" \
+                    --argjson formula_ci_run_id "${FORMULA_CI_RUN_ID}" \
+                    --argjson pull_request "${PR_NUMBER}" \
+                    --argjson review_id "${APPROVAL_ID}" \
+                    '{
+                      event_type: "publish-bottles",
+                      client_payload: {
+                        pull_request: $pull_request,
+                        head_sha: $head_sha,
+                        formula_ci_run_id: $formula_ci_run_id,
+                        review_id: $review_id
+                      }
+                    }'
+                )"
+
+                gh api \
+                  --method POST \
+                  "/repos/${GITHUB_REPOSITORY}/dispatches" \
+                  --input - <<<"${DISPATCH_PAYLOAD}"
+                CATCH_UP_STATUS="requested"
+              fi
             fi
           fi
 
@@ -456,6 +499,9 @@ jobs:
               echo "Reused successful Formula CI run https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID} and requested **Publish Bottles**."
             elif [[ "${CATCH_UP_STATUS}" = "ci-required" ]]; then
               echo
-              echo "No successful Formula CI run was found for this exact head. Run or rerun **Formula CI**; after it succeeds, its publication-request job will start **Publish Bottles**."
+              echo "No successful Formula CI run was found for this exact head. Run or rerun **Formula CI**; publication starts automatically once both successful CI and a current-head approval exist."
+            elif [[ "${CATCH_UP_STATUS}" = "approval-required" ]]; then
+              echo
+              echo "The exact pull request head already has successful Formula CI bottles. Submit one approving review to start **Publish Bottles**."
             fi
           } >>"${GITHUB_STEP_SUMMARY}"
