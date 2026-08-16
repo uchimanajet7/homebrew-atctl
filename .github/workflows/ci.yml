@@ -71,3 +71,128 @@ jobs:
           name: bottles_macos-26
           path: "*.bottle.*"
           if-no-files-found: error
+
+  request-bottle-publication-decision:
+    name: Start Publish Bottles decision
+    needs: formula
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.formula.result == 'success' &&
+      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'formula/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Dispatch publication decision
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+          PULL_REQUEST_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::The Formula CI event did not contain a valid pull request number."
+            exit 1
+          fi
+
+          if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The Formula CI event did not contain a full 40-character lowercase head SHA."
+            exit 1
+          fi
+
+          if [[ "${PULL_REQUEST_AUTHOR}" != "github-actions[bot]" ||
+            "${HEAD_REPOSITORY}" != "${GITHUB_REPOSITORY}" ||
+            ! "${HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::The publication decision can only be requested for a bot-created Formula branch in ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+
+          PR_READY="false"
+          for _ in {1..30}; do
+            PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+
+            if jq -e \
+              --arg default_branch "${DEFAULT_BRANCH}" \
+              --arg head_branch "${HEAD_BRANCH}" \
+              --arg head_sha "${HEAD_SHA}" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              '
+                .state == "open" and
+                .draft == false and
+                .base.ref == $default_branch and
+                .head.ref == $head_branch and
+                .head.sha == $head_sha and
+                .head.repo.full_name == $repository and
+                .user.login == "github-actions[bot]"
+              ' <<<"${PR_JSON}" >/dev/null; then
+              PR_READY="true"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ "${PR_READY}" != "true" ]]; then
+            echo "::error::Pull request #${PULL_REQUEST} did not converge to the Formula CI head ${HEAD_SHA}."
+            exit 1
+          fi
+
+          CHANGED_FILES_READY="false"
+          for _ in {1..30}; do
+            CHANGED_FILES="$(
+              gh api \
+                --paginate \
+                "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" \
+                --jq '.[].filename'
+            )"
+
+            if [[ "${CHANGED_FILES}" = "Formula/atctl.rb" ]]; then
+              CHANGED_FILES_READY="true"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ "${CHANGED_FILES_READY}" != "true" ]]; then
+            echo "::error::The publication decision requires Formula/atctl.rb to be the pull request's only changed file."
+            printf '%s\n' "${CHANGED_FILES}"
+            exit 1
+          fi
+
+          DISPATCH_PAYLOAD="$(
+            jq -cn \
+              --arg head_sha "${HEAD_SHA}" \
+              --argjson formula_ci_run_id "${GITHUB_RUN_ID}" \
+              --argjson pull_request "${PULL_REQUEST}" \
+              '{
+                event_type: "evaluate-bottle-publication",
+                client_payload: {
+                  pull_request: $pull_request,
+                  head_sha: $head_sha,
+                  formula_ci_run_id: $formula_ci_run_id
+                }
+              }'
+          )"
+
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/dispatches" \
+            --input - <<<"${DISPATCH_PAYLOAD}"
+
+          {
+            echo "## Bottle publication decision"
+            echo
+            echo "Requested **Publish Bottles** for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
+            echo
+            echo "That workflow will record whether publication is disabled, waiting for approval, or ready to publish."
+          } >>"${GITHUB_STEP_SUMMARY}"

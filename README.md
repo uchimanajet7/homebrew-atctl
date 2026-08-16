@@ -41,12 +41,14 @@ Homebrew publication is separate from the main `atctl` release.
 3. Open the generated Formula pull request and review its exact head commit.
 4. If GitHub displays **Approve workflows to run**, approve it and wait for
    **Formula CI** to succeed. This approval only permits CI to run; it does not
-   publish bottles or merge the pull request.
+   publish bottles or merge the pull request. After CI succeeds, its final job
+   starts a **Publish Bottles** decision run for the exact PR head.
 5. When the checkbox was enabled, open **Files changed**, select **Review
    changes**, choose **Approve**, and submit the review once. As soon as
    successful **Formula CI** and that exact-head approval both exist, **Publish
-   Bottles** starts; no deployment approval or manual merge is required. The
-   approval may be submitted before CI finishes.
+   Bottles** publishes; no deployment approval or manual merge is required. The
+   approval may be submitted before or after CI finishes. If CI finishes first,
+   its decision run completes successfully while waiting for that approval.
 6. **Publish Bottles** revalidates the open bot-created PR, current head SHA,
    Formula-only change, repository-owner approval, successful Formula CI run,
    and exact bottle artifact. It then publishes the bottles and pushes the
@@ -56,10 +58,11 @@ Homebrew publication is separate from the main `atctl` release.
    once. An approval for an older head cannot publish the replacement commit.
 
 If bottle publication is intentionally not needed, clear the checkbox when
-running **Update Formula PR**. Formula CI still runs, but the PR's publication
-setting remains disabled. Approving the pull request does not start bottle
-publication or an automatic `main` update. Manually merge the reviewed Formula
-pull request after its checks succeed.
+running **Update Formula PR**. Formula CI still runs and then starts **Publish
+Bottles**. Its **Decide bottle publication** job records **disabled** and
+completes successfully, while **Publish bottles and update main** is skipped. No
+bottle publication or automatic `main` update occurs. Manually merge the
+reviewed Formula pull request after its checks succeed.
 
 To enable publication later without changing the Formula commit, rerun **Update
 Formula PR** with the checkbox enabled. When that exact pull request head already
@@ -79,16 +82,16 @@ checks, then run `brew pr-pull` with the reviewed head SHA so publication fails
 safely if the pull request changed.
 
 The explicit publication request uses GitHub's documented
-`repository_dispatch` exception for events created with `GITHUB_TOKEN`. The
-PR-approval event and Formula-CI-completion event both evaluate the same current
-state, so whichever condition completes second sends that request without an
-order-dependent gap. The receiving workflow revalidates the current
+`repository_dispatch` exception for events created with `GITHUB_TOKEN`.
+Formula CI's final job always sends a decision request after a successful bot PR
+build. A repository-owner PR approval also sends a decision request. The
+default-branch decision run revalidates the current
 repository-owner approval, successful Formula CI run, bottle artifact, exact PR
 head, Formula-only change set, and enabled marker before publishing.
 
 - [Homebrew: How to Create and Maintain a Tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
 - [GitHub: Pull request review workflow event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review)
-- [GitHub: Workflow run completion event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
+- [GitHub: Events triggered by `GITHUB_TOKEN`](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
 - [GitHub: REST API endpoints for pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
 - [GitHub: Triggering a workflow from a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)
 - [GitHub: Create a repository dispatch event](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event)
