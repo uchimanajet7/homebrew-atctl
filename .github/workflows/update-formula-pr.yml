@@ -14,6 +14,7 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -125,8 +126,10 @@ jobs:
               ;;
           esac
 
-          PR_NUMBER="$(gh pr view "${PR_URL}" --json number --jq '.number')"
-          PR_HEAD_SHA="$(gh pr view "${PR_URL}" --json headRefOid --jq '.headRefOid')"
+          PR_DETAILS="$(gh pr view "${PR_URL}" --json body,headRefOid,number)"
+          PR_NUMBER="$(jq -r '.number' <<<"${PR_DETAILS}")"
+          PR_HEAD_SHA="$(jq -r '.headRefOid' <<<"${PR_DETAILS}")"
+          EXISTING_PR_BODY="$(jq -r '.body // ""' <<<"${PR_DETAILS}")"
 
           if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::GitHub returned an invalid pull request number: ${PR_NUMBER}"
@@ -136,6 +139,21 @@ jobs:
           if [[ ! "${PR_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::GitHub returned an invalid pull request head SHA: ${PR_HEAD_SHA}"
             exit 1
+          fi
+
+          PREVIOUS_TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${PR_HEAD_SHA} -->"
+          PREVIOUS_FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${PR_HEAD_SHA} -->"
+          PREVIOUS_TRUE_COUNT="$(grep -Fxc -- "${PREVIOUS_TRUE_MARKER}" <<<"${EXISTING_PR_BODY}" || true)"
+          PREVIOUS_FALSE_COUNT="$(grep -Fxc -- "${PREVIOUS_FALSE_MARKER}" <<<"${EXISTING_PR_BODY}" || true)"
+
+          if (( PREVIOUS_TRUE_COUNT > 1 || PREVIOUS_FALSE_COUNT > 1 || (PREVIOUS_TRUE_COUNT == 1 && PREVIOUS_FALSE_COUNT == 1) )); then
+            echo "::error::The existing Formula PR contains an ambiguous publication marker for ${PR_HEAD_SHA}."
+            exit 1
+          fi
+
+          ENABLED_EXISTING_HEAD="false"
+          if [[ "${PUBLISH_BOTTLES}" = "true" && "${PREVIOUS_TRUE_COUNT}" = "0" && "${PREVIOUS_FALSE_COUNT}" = "1" ]]; then
+            ENABLED_EXISTING_HEAD="true"
           fi
 
           PUBLISH_URL="https://github.com/${GITHUB_REPOSITORY}/actions/workflows/publish-bottles.yml"
@@ -149,13 +167,15 @@ jobs:
             if [ "${PUBLISH_BOTTLES}" = "true" ]; then
               echo "Automatic bottle publication: **Enabled**"
               echo
-              echo "After **Formula CI** succeeds for this exact head, **Publish Bottles** starts automatically and waits for approval in the \`homebrew-publication\` environment. Review that deployment and select **Approve and deploy** to publish the bottles and update \`main\`."
+              echo "After **Formula CI** succeeds for this exact head, it explicitly requests **Publish Bottles**, which waits for approval in the \`homebrew-publication\` environment. Review that deployment and select **Approve and deploy** to publish the bottles and update \`main\`."
+              echo
+              echo "If this exact head already passed **Formula CI** while publication was disabled, rerunning **Update Formula PR** with this setting enabled reuses that successful CI run and requests **Publish Bottles** immediately."
               echo
               echo "Do not manually merge this pull request before bottle publication."
             else
               echo "Automatic bottle publication: **Disabled**"
               echo
-              echo "After **Formula CI** succeeds, no automatic publication approval is requested and no bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
+              echo "After **Formula CI** succeeds, it does not start **Publish Bottles**. No publication approval is requested and no bottles or \`main\` update are published. Merge this pull request manually if bottles are intentionally not required, or use the manual workflow below to publish later."
             fi
             echo
             echo "If GitHub shows **Approve workflows to run**, approve it and wait for **Formula CI** to succeed. This approval only allows CI to run; it does not publish bottles or merge this pull request."
@@ -184,10 +204,106 @@ jobs:
 
           gh pr edit "${PR_URL}" --body-file "${PR_BODY_FILE}"
 
+          CATCH_UP_STATUS="not-needed"
+          FORMULA_CI_RUN_ID=""
+          if [[ "${ENABLED_EXISTING_HEAD}" = "true" ]]; then
+            CI_RUNS_JSON="$(
+              gh api \
+                --method GET \
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+                -f event=pull_request \
+                -f head_sha="${PR_HEAD_SHA}" \
+                -f status=success \
+                -F per_page=100
+            )"
+
+            FORMULA_CI_RUN_ID="$(
+              jq -r \
+                --arg head_branch "${BRANCH}" \
+                --arg head_sha "${PR_HEAD_SHA}" \
+                --arg repository "${GITHUB_REPOSITORY}" \
+                --argjson pull_request "${PR_NUMBER}" \
+                '
+                  [
+                    .workflow_runs[]?
+                    | select(
+                        .name == "Formula CI" and
+                        ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
+                        .event == "pull_request" and
+                        .status == "completed" and
+                        .conclusion == "success" and
+                        .head_branch == $head_branch and
+                        .head_sha == $head_sha and
+                        .head_repository.full_name == $repository and
+                        .actor.login == "github-actions[bot]" and
+                        any(.pull_requests[]?; .number == $pull_request)
+                      )
+                  ]
+                  | sort_by(.updated_at)
+                  | last
+                  | .id // empty
+                ' <<<"${CI_RUNS_JSON}"
+            )"
+
+            if [[ -z "${FORMULA_CI_RUN_ID}" ]]; then
+              CATCH_UP_STATUS="ci-required"
+            elif [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::GitHub returned an invalid Formula CI run ID: ${FORMULA_CI_RUN_ID}"
+              exit 1
+            else
+              ARTIFACTS_JSON="$(
+                gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100"
+              )"
+
+              if ! jq -e \
+                --arg head_sha "${PR_HEAD_SHA}" \
+                '
+                  any(
+                    .artifacts[]?;
+                    .name == "bottles_macos-26" and
+                    .expired == false and
+                    .size_in_bytes > 0 and
+                    .workflow_run.head_sha == $head_sha
+                  )
+                ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
+                echo "::error::Formula CI run ${FORMULA_CI_RUN_ID} has no usable bottles_macos-26 artifact for ${PR_HEAD_SHA}; rerun Formula CI before publishing."
+                exit 1
+              fi
+
+              DISPATCH_PAYLOAD="$(
+                jq -cn \
+                  --arg head_sha "${PR_HEAD_SHA}" \
+                  --argjson formula_ci_run_id "${FORMULA_CI_RUN_ID}" \
+                  --argjson pull_request "${PR_NUMBER}" \
+                  '{
+                    event_type: "publish-bottles",
+                    client_payload: {
+                      pull_request: $pull_request,
+                      head_sha: $head_sha,
+                      formula_ci_run_id: $formula_ci_run_id
+                    }
+                  }'
+              )"
+
+              gh api \
+                --method POST \
+                "/repos/${GITHUB_REPOSITORY}/dispatches" \
+                --input - <<<"${DISPATCH_PAYLOAD}"
+              CATCH_UP_STATUS="requested"
+            fi
+          fi
+
           {
             echo "## Formula update pull request"
             echo
             echo "Pull request: ${PR_URL}"
             echo
             cat "${HANDOFF_FILE}"
+            if [[ "${CATCH_UP_STATUS}" = "requested" ]]; then
+              echo
+              echo "Reused successful Formula CI run https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID} and requested **Publish Bottles**."
+            elif [[ "${CATCH_UP_STATUS}" = "ci-required" ]]; then
+              echo
+              echo "No successful Formula CI run was found for this exact head. Run or rerun **Formula CI**; after it succeeds, its publication-request job will start **Publish Bottles**."
+            fi
           } >>"${GITHUB_STEP_SUMMARY}"

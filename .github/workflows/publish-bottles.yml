@@ -1,15 +1,13 @@
 name: Publish Bottles
 
-run-name: Publish bottles (${{ github.event_name == 'workflow_dispatch' && 'manual' || 'after Formula CI' }})
+run-name: >-
+  Publish bottles for PR #${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event.client_payload.pull_request }}
+  (${{ github.event_name == 'workflow_dispatch' && 'manual' || 'after Formula CI' }})
 
 on:
-  workflow_run:
-    workflows:
-      - Formula CI
+  repository_dispatch:
     types:
-      - completed
-    branches:
-      - "formula/**"
+      - publish-bottles
   workflow_dispatch:
     inputs:
       pull_request:
@@ -25,10 +23,6 @@ permissions: {}
 
 jobs:
   prepare-publication:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -37,7 +31,6 @@ jobs:
     outputs:
       head_sha: ${{ steps.publication.outputs.head_sha }}
       pull_request: ${{ steps.publication.outputs.pull_request }}
-      should_publish: ${{ steps.publication.outputs.should_publish }}
       source: ${{ steps.publication.outputs.source }}
 
     steps:
@@ -48,12 +41,11 @@ jobs:
           DISPATCH_HEAD_SHA: ${{ inputs.head_sha }}
           DISPATCH_PULL_REQUEST: ${{ inputs.pull_request }}
           EVENT_NAME: ${{ github.event_name }}
+          FORMULA_CI_RUN_ID: ${{ github.event.client_payload.formula_ci_run_id }}
           GH_TOKEN: ${{ github.token }}
-          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
-          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          WORKFLOW_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
-          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPOSITORY_DISPATCH_ACTION: ${{ github.event.action }}
+          REPOSITORY_DISPATCH_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          REPOSITORY_DISPATCH_PULL_REQUEST: ${{ github.event.client_payload.pull_request }}
         run: |
           set -euo pipefail
 
@@ -66,32 +58,19 @@ jobs:
             SOURCE="manual"
             PULL_REQUEST="${DISPATCH_PULL_REQUEST}"
             HEAD_SHA="${DISPATCH_HEAD_SHA}"
-          else
+            FORMULA_CI_RUN_ID=""
+          elif [[ "${EVENT_NAME}" = "repository_dispatch" ]]; then
             SOURCE="automatic"
+            PULL_REQUEST="${REPOSITORY_DISPATCH_PULL_REQUEST}"
+            HEAD_SHA="${REPOSITORY_DISPATCH_HEAD_SHA}"
 
-            if [[ "${WORKFLOW_EVENT}" != "pull_request" || "${WORKFLOW_CONCLUSION}" != "success" ]]; then
-              echo "::error::Automatic publication requires a successful pull_request Formula CI run."
+            if [[ "${REPOSITORY_DISPATCH_ACTION}" != "publish-bottles" ]]; then
+              echo "::error::Unexpected repository_dispatch action: ${REPOSITORY_DISPATCH_ACTION}"
               exit 1
             fi
-
-            if [[ "${WORKFLOW_HEAD_REPOSITORY}" != "${GITHUB_REPOSITORY}" ]]; then
-              echo "::error::Automatic publication requires Formula CI to run from ${GITHUB_REPOSITORY}."
-              exit 1
-            fi
-
-            if [[ ! "${WORKFLOW_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
-              echo "::error::Unexpected Formula CI head branch: ${WORKFLOW_HEAD_BRANCH}"
-              exit 1
-            fi
-
-            PULL_REQUEST_COUNT="$(jq -r '.workflow_run.pull_requests | length' "${GITHUB_EVENT_PATH}")"
-            if [[ "${PULL_REQUEST_COUNT}" != "1" ]]; then
-              echo "::error::Formula CI must resolve to exactly one pull request; found ${PULL_REQUEST_COUNT}."
-              exit 1
-            fi
-
-            PULL_REQUEST="$(jq -r '.workflow_run.pull_requests[0].number' "${GITHUB_EVENT_PATH}")"
-            HEAD_SHA="${WORKFLOW_HEAD_SHA}"
+          else
+            echo "::error::Unexpected publication event: ${EVENT_NAME}"
+            exit 1
           fi
 
           if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ ]]; then
@@ -101,6 +80,11 @@ jobs:
 
           if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::head_sha must be the full 40-character lowercase Git commit SHA from the reviewed Formula PR."
+            exit 1
+          fi
+
+          if [[ "${SOURCE}" = "automatic" && ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Automatic publication requires a valid Formula CI run ID."
             exit 1
           fi
 
@@ -128,25 +112,19 @@ jobs:
             exit 1
           fi
 
-          if [[ "${SOURCE}" = "automatic" && "${PR_HEAD_BRANCH}" != "${WORKFLOW_HEAD_BRANCH}" ]]; then
-            echo "::error::Formula CI ran for ${WORKFLOW_HEAD_BRANCH}, but pull request #${PULL_REQUEST} now uses ${PR_HEAD_BRANCH}."
-            exit 1
-          fi
-
-          mapfile -t CHANGED_FILES < <(
+          CHANGED_FILES="$(
             gh api \
               --paginate \
               "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" \
               --jq '.[].filename'
-          )
+          )"
 
-          if (( ${#CHANGED_FILES[@]} != 1 )) || [[ "${CHANGED_FILES[0]:-}" != "Formula/atctl.rb" ]]; then
+          if [[ "${CHANGED_FILES}" != "Formula/atctl.rb" ]]; then
             echo "::error::Publication requires Formula/atctl.rb to be the pull request's only changed file."
-            printf '::error::Changed file: %s\n' "${CHANGED_FILES[@]}"
+            printf '%s\n' "${CHANGED_FILES}"
             exit 1
           fi
 
-          SHOULD_PUBLISH="true"
           if [[ "${SOURCE}" = "automatic" ]]; then
             PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
             TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
@@ -154,46 +132,94 @@ jobs:
             TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
             FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
 
-            if (( TRUE_COUNT > 1 || FALSE_COUNT > 1 || (TRUE_COUNT == 1 && FALSE_COUNT == 1) )); then
-              echo "::error::The Formula PR contains an ambiguous automatic-publication marker."
+            if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
+              echo "::error::Automatic bottle publication is not enabled exactly once for the requested pull request head."
               exit 1
             fi
 
-            if [[ "${TRUE_COUNT}" = "1" ]]; then
-              SHOULD_PUBLISH="true"
-            else
-              SHOULD_PUBLISH="false"
+            CI_RUN_STATUS=""
+            for _ in {1..15}; do
+              CI_RUN_JSON="$(
+                gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
+              )"
+              CI_RUN_STATUS="$(jq -r '.status' <<<"${CI_RUN_JSON}")"
+              if [[ "${CI_RUN_STATUS}" = "completed" ]]; then
+                break
+              fi
+              sleep 2
+            done
+
+            if [[ "${CI_RUN_STATUS}" != "completed" ]]; then
+              echo "::error::Formula CI run ${FORMULA_CI_RUN_ID} did not complete before publication preparation."
+              exit 1
+            fi
+
+            if ! jq -e \
+              --arg head_branch "${PR_HEAD_BRANCH}" \
+              --arg head_sha "${HEAD_SHA}" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --argjson pull_request "${PULL_REQUEST}" \
+              '
+                .name == "Formula CI" and
+                ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
+                .event == "pull_request" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_branch == $head_branch and
+                .head_sha == $head_sha and
+                .head_repository.full_name == $repository and
+                .actor.login == "github-actions[bot]" and
+                any(.pull_requests[]?; .number == $pull_request)
+              ' <<<"${CI_RUN_JSON}" >/dev/null; then
+              echo "::error::Run ${FORMULA_CI_RUN_ID} is not the successful Formula CI run for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
+              exit 1
+            fi
+
+            ARTIFACTS_JSON="$(
+              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100"
+            )"
+
+            if ! jq -e \
+              --arg head_sha "${HEAD_SHA}" \
+              '
+                any(
+                  .artifacts[]?;
+                  .name == "bottles_macos-26" and
+                  .expired == false and
+                  .size_in_bytes > 0 and
+                  .workflow_run.head_sha == $head_sha
+                )
+              ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
+              echo "::error::Formula CI run ${FORMULA_CI_RUN_ID} has no usable bottles_macos-26 artifact for ${HEAD_SHA}."
+              exit 1
             fi
           fi
 
-          if [[ "${SHOULD_PUBLISH}" = "true" ]]; then
-            if ! ENVIRONMENT_JSON="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/environments/homebrew-publication" 2>/dev/null
-            )"; then
-              echo "::error::Create the homebrew-publication environment with uchimanajet7 as a required reviewer before publishing."
-              exit 1
-            fi
+          if ! ENVIRONMENT_JSON="$(
+            gh api "/repos/${GITHUB_REPOSITORY}/environments/homebrew-publication" 2>/dev/null
+          )"; then
+            echo "::error::Create the homebrew-publication environment with uchimanajet7 as a required reviewer before publishing."
+            exit 1
+          fi
 
-            if ! jq -e '
+          if ! jq -e '
+            any(
+              .protection_rules[]?;
+              .type == "required_reviewers" and
+              .prevent_self_review == false and
               any(
-                .protection_rules[]?;
-                .type == "required_reviewers" and
-                .prevent_self_review == false and
-                any(
-                  .reviewers[]?;
-                  .type == "User" and .reviewer.login == "uchimanajet7"
-                )
+                .reviewers[]?;
+                .type == "User" and .reviewer.login == "uchimanajet7"
               )
-            ' <<<"${ENVIRONMENT_JSON}" >/dev/null; then
-              echo "::error::The homebrew-publication environment must require review by uchimanajet7 and allow self-review for manual runs."
-              exit 1
-            fi
+            )
+          ' <<<"${ENVIRONMENT_JSON}" >/dev/null; then
+            echo "::error::The homebrew-publication environment must require review by uchimanajet7 and allow self-review for manual runs."
+            exit 1
           fi
 
           {
             echo "pull_request=${PULL_REQUEST}"
             echo "head_sha=${HEAD_SHA}"
-            echo "should_publish=${SHOULD_PUBLISH}"
             echo "source=${SOURCE}"
           } >>"${GITHUB_OUTPUT}"
 
@@ -204,18 +230,17 @@ jobs:
             echo
             echo "Reviewed head: \`${HEAD_SHA}\`"
             echo
-            if [[ "${SHOULD_PUBLISH}" = "true" ]]; then
-              echo "Publication source: **${SOURCE}**"
+            echo "Publication source: **${SOURCE}**"
+            echo
+            if [[ "${SOURCE}" = "automatic" ]]; then
+              echo "Formula CI run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
               echo
-              echo "The publication job will wait for approval in the \`homebrew-publication\` environment."
-            else
-              echo "Automatic bottle publication is disabled for this exact pull request head. No publication approval was requested."
             fi
+            echo "The publication job will wait for approval in the \`homebrew-publication\` environment."
           } >>"${GITHUB_STEP_SUMMARY}"
 
   publish-bottles:
     needs: prepare-publication
-    if: needs.prepare-publication.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     environment:
       name: homebrew-publication
@@ -302,16 +327,16 @@ jobs:
             exit 1
           fi
 
-          mapfile -t CHANGED_FILES < <(
+          CHANGED_FILES="$(
             gh api \
               --paginate \
               "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" \
               --jq '.[].filename'
-          )
+          )"
 
-          if (( ${#CHANGED_FILES[@]} != 1 )) || [[ "${CHANGED_FILES[0]:-}" != "Formula/atctl.rb" ]]; then
+          if [[ "${CHANGED_FILES}" != "Formula/atctl.rb" ]]; then
             echo "::error::Publication requires Formula/atctl.rb to remain the pull request's only changed file."
-            printf '::error::Changed file: %s\n' "${CHANGED_FILES[@]}"
+            printf '%s\n' "${CHANGED_FILES}"
             exit 1
           fi
 
