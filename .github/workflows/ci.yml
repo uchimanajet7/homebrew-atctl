@@ -125,23 +125,32 @@ jobs:
             exit 1
           fi
 
-          PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+          PR_JSON=""
+          PR_HEAD_CONFIRMED="false"
+          for _ in {1..30}; do
+            if PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")" &&
+              jq -e \
+                --arg default_branch "${DEFAULT_BRANCH}" \
+                --arg head_branch "${HEAD_BRANCH}" \
+                --arg head_sha "${HEAD_SHA}" \
+                --arg repository "${GITHUB_REPOSITORY}" \
+                '
+                  .state == "open" and
+                  .draft == false and
+                  .base.ref == $default_branch and
+                  .head.ref == $head_branch and
+                  .head.sha == $head_sha and
+                  .head.repo.full_name == $repository and
+                  .user.login == "github-actions[bot]"
+                ' <<<"${PR_JSON}" >/dev/null; then
+              PR_HEAD_CONFIRMED="true"
+              break
+            fi
+            sleep 2
+          done
 
-          if ! jq -e \
-            --arg default_branch "${DEFAULT_BRANCH}" \
-            --arg head_branch "${HEAD_BRANCH}" \
-            --arg head_sha "${HEAD_SHA}" \
-            --arg repository "${GITHUB_REPOSITORY}" \
-            '
-              .state == "open" and
-              .draft == false and
-              .base.ref == $default_branch and
-              .head.ref == $head_branch and
-              .head.sha == $head_sha and
-              .head.repo.full_name == $repository and
-              .user.login == "github-actions[bot]"
-            ' <<<"${PR_JSON}" >/dev/null; then
-            echo "::error::The pull request is not the expected open, non-draft, bot-created Formula PR at ${HEAD_SHA}."
+          if [[ "${PR_HEAD_CONFIRMED}" != "true" ]]; then
+            echo "::error::The pull request did not converge to the expected open, non-draft, bot-created Formula PR at ${HEAD_SHA}."
             exit 1
           fi
 
@@ -158,13 +167,54 @@ jobs:
             exit 1
           fi
 
-          PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
           TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
           FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
-          TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
-          FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+          PUBLICATION_SETTING=""
 
-          if [[ "${TRUE_COUNT}" = "0" && "${FALSE_COUNT}" = "1" ]]; then
+          for _ in {1..30}; do
+            PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+
+            if ! jq -e \
+              --arg default_branch "${DEFAULT_BRANCH}" \
+              --arg head_branch "${HEAD_BRANCH}" \
+              --arg head_sha "${HEAD_SHA}" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              '
+                .state == "open" and
+                .draft == false and
+                .base.ref == $default_branch and
+                .head.ref == $head_branch and
+                .head.sha == $head_sha and
+                .head.repo.full_name == $repository and
+                .user.login == "github-actions[bot]"
+              ' <<<"${PR_JSON}" >/dev/null; then
+              sleep 2
+              continue
+            fi
+
+            PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
+            TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
+            FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+
+            if (( TRUE_COUNT > 1 || FALSE_COUNT > 1 || (TRUE_COUNT == 1 && FALSE_COUNT == 1) )); then
+              echo "::error::The Formula PR contains an ambiguous publication marker for ${HEAD_SHA}."
+              exit 1
+            fi
+
+            if [[ "${TRUE_COUNT}" = "1" && "${FALSE_COUNT}" = "0" ]]; then
+              PUBLICATION_SETTING="enabled"
+              break
+            fi
+
+            if [[ "${TRUE_COUNT}" = "0" && "${FALSE_COUNT}" = "1" ]]; then
+              PUBLICATION_SETTING="disabled"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ "${PUBLICATION_SETTING}" = "disabled" ]]; then
             {
               echo "## Bottle publication"
               echo
@@ -175,8 +225,8 @@ jobs:
             exit 0
           fi
 
-          if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
-            echo "::error::The Formula PR must contain exactly one unambiguous publication marker for ${HEAD_SHA}."
+          if [[ "${PUBLICATION_SETTING}" != "enabled" ]]; then
+            echo "::error::The Formula PR did not expose exactly one publication setting for ${HEAD_SHA}."
             exit 1
           fi
 

@@ -49,6 +49,7 @@ jobs:
 
       - name: Create or update formula pull request
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           PUBLISH_BOTTLES: ${{ inputs.publish_bottles }}
           RELEASE_TAG: ${{ inputs.tag }}
@@ -64,9 +65,21 @@ jobs:
               ;;
           esac
 
+          if [[ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Update Formula PR must run from the repository default branch ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Update Formula PR did not receive a full 40-character lowercase default-branch SHA."
+            exit 1
+          fi
+
           SAFE_TAG="${RELEASE_TAG//[^A-Za-z0-9._-]/-}"
           BRANCH="formula/${SAFE_TAG}"
           REMOTE_BRANCH_REF="refs/heads/${BRANCH}"
+          FORMULA_HEAD_CHANGED="false"
+          EXPECTED_PR_HEAD_SHA=""
 
           PR_COUNT="$(
             gh pr list \
@@ -78,18 +91,69 @@ jobs:
               --jq 'length'
           )"
 
+          case "${PR_COUNT}" in
+            0|1)
+              ;;
+            *)
+              echo "::error::Found ${PR_COUNT} open pull requests for ${BRANCH}; expected at most one."
+              exit 1
+              ;;
+          esac
+
+          REMOTE_BRANCH_SHA="$(
+            git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+
+          if [[ -n "${REMOTE_BRANCH_SHA}" && ! "${REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Git returned an invalid remote Formula branch SHA: ${REMOTE_BRANCH_SHA}"
+            exit 1
+          fi
+
           if [ -n "$(git status --short -- Formula/atctl.rb)" ]; then
-            git checkout -B "${BRANCH}"
-            git add Formula/atctl.rb
-            git commit -m "Update atctl formula to ${RELEASE_TAG}"
-            REMOTE_BRANCH_SHA="$(
-              git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
-                awk 'NR == 1 { print $1 }'
-            )"
-            git push \
-              --force-with-lease="${REMOTE_BRANCH_REF}:${REMOTE_BRANCH_SHA}" \
-              origin \
-              "${BRANCH}:${REMOTE_BRANCH_REF}"
+            GENERATED_FORMULA_BLOB="$(git hash-object Formula/atctl.rb)"
+            REMOTE_FORMULA_BLOB=""
+            REMOTE_PARENT_SHAS=""
+
+            if [[ "${PR_COUNT}" = "1" ]]; then
+              if [[ -z "${REMOTE_BRANCH_SHA}" ]]; then
+                echo "::error::The open Formula pull request has no remote ${BRANCH} branch."
+                exit 1
+              fi
+
+              git fetch --no-tags --depth=1 origin "${REMOTE_BRANCH_REF}"
+              if git cat-file -e "${REMOTE_BRANCH_SHA}:Formula/atctl.rb" 2>/dev/null; then
+                REMOTE_FORMULA_BLOB="$(git rev-parse "${REMOTE_BRANCH_SHA}:Formula/atctl.rb")"
+              fi
+              REMOTE_PARENT_SHAS="$(
+                git cat-file -p "${REMOTE_BRANCH_SHA}" |
+                  awk '$1 == "parent" { print $2 }'
+              )"
+            fi
+
+            if [[
+              "${PR_COUNT}" = "1" &&
+              "${GENERATED_FORMULA_BLOB}" = "${REMOTE_FORMULA_BLOB}" &&
+              "${REMOTE_PARENT_SHAS}" = "${GITHUB_SHA}"
+            ]]; then
+              EXPECTED_PR_HEAD_SHA="${REMOTE_BRANCH_SHA}"
+            else
+              FORMULA_HEAD_CHANGED="true"
+              git checkout -B "${BRANCH}"
+              git add Formula/atctl.rb
+              git commit -m "Update atctl formula to ${RELEASE_TAG}"
+              EXPECTED_PR_HEAD_SHA="$(git rev-parse HEAD)"
+
+              if [[ ! "${EXPECTED_PR_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::Git returned an invalid new Formula commit SHA: ${EXPECTED_PR_HEAD_SHA}"
+                exit 1
+              fi
+
+              git push \
+                --force-with-lease="${REMOTE_BRANCH_REF}:${REMOTE_BRANCH_SHA}" \
+                origin \
+                "${BRANCH}:${REMOTE_BRANCH_REF}"
+            fi
           elif [ "${PR_COUNT}" -eq 0 ]; then
             {
               echo "## Formula update"
@@ -97,7 +161,37 @@ jobs:
               echo "\`Formula/atctl.rb\` is already up to date for ${RELEASE_TAG}; no open ${BRANCH} pull request requires synchronization."
             } >>"${GITHUB_STEP_SUMMARY}"
             exit 0
+          else
+            if [[ -z "${REMOTE_BRANCH_SHA}" ]]; then
+              echo "::error::The open Formula pull request has no remote ${BRANCH} branch."
+              exit 1
+            fi
+            EXPECTED_PR_HEAD_SHA="${REMOTE_BRANCH_SHA}"
           fi
+
+          if [[ ! "${EXPECTED_PR_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The expected Formula pull request head is not a full 40-character lowercase SHA."
+            exit 1
+          fi
+
+          INITIAL_PR_BODY_FILE="$(mktemp)"
+          HANDOFF_FILE="$(mktemp)"
+          PR_BODY_FILE="$(mktemp)"
+          trap 'rm -f "${INITIAL_PR_BODY_FILE}" "${HANDOFF_FILE}" "${PR_BODY_FILE}"' EXIT
+
+          {
+            echo "Updates \`Formula/atctl.rb\` for [uchimanajet7/atctl ${RELEASE_TAG}](https://github.com/uchimanajet7/atctl/releases/tag/${RELEASE_TAG}) using \`scripts/update-formula.rb\`."
+            echo
+            echo "## Bottle publication"
+            echo
+            if [[ "${PUBLISH_BOTTLES}" = "true" ]]; then
+              echo "Automatic bottle publication: **Enabled**"
+            else
+              echo "Automatic bottle publication: **Disabled**"
+            fi
+            echo
+            echo "<!-- homebrew-atctl-publish-bottles=${PUBLISH_BOTTLES} head_sha=${EXPECTED_PR_HEAD_SHA} -->"
+          } >"${INITIAL_PR_BODY_FILE}"
 
           case "${PR_COUNT}" in
             0)
@@ -106,7 +200,7 @@ jobs:
                   --base "${GITHUB_REF_NAME}" \
                   --head "${BRANCH}" \
                   --title "Update atctl formula to ${RELEASE_TAG}" \
-                  --body "Updates Formula/atctl.rb for uchimanajet7/atctl ${RELEASE_TAG} using scripts/update-formula.rb."
+                  --body-file "${INITIAL_PR_BODY_FILE}"
               )"
               ;;
             1)
@@ -126,9 +220,29 @@ jobs:
               ;;
           esac
 
-          PR_DETAILS="$(gh pr view "${PR_URL}" --json body,headRefOid,number)"
+          PR_DETAILS=""
+          OBSERVED_PR_HEAD_SHA=""
+          for _ in {1..30}; do
+            if PR_DETAILS="$(
+              gh pr view \
+                "${PR_URL}" \
+                --json baseRefName,body,headRefName,headRefOid,isDraft,number,state
+            )"; then
+              OBSERVED_PR_HEAD_SHA="$(jq -r '.headRefOid // ""' <<<"${PR_DETAILS}")"
+              if [[ "${OBSERVED_PR_HEAD_SHA}" = "${EXPECTED_PR_HEAD_SHA}" ]]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [[ "${OBSERVED_PR_HEAD_SHA}" != "${EXPECTED_PR_HEAD_SHA}" ]]; then
+            echo "::error::Pull request ${PR_URL} did not converge to pushed head ${EXPECTED_PR_HEAD_SHA}; last observed ${OBSERVED_PR_HEAD_SHA:-none}."
+            exit 1
+          fi
+
           PR_NUMBER="$(jq -r '.number' <<<"${PR_DETAILS}")"
-          PR_HEAD_SHA="$(jq -r '.headRefOid' <<<"${PR_DETAILS}")"
+          PR_HEAD_SHA="${EXPECTED_PR_HEAD_SHA}"
           EXISTING_PR_BODY="$(jq -r '.body // ""' <<<"${PR_DETAILS}")"
 
           if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
@@ -138,6 +252,19 @@ jobs:
 
           if [[ ! "${PR_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::GitHub returned an invalid pull request head SHA: ${PR_HEAD_SHA}"
+            exit 1
+          fi
+
+          if ! jq -e \
+            --arg base_branch "${GITHUB_REF_NAME}" \
+            --arg head_branch "${BRANCH}" \
+            '
+              .state == "OPEN" and
+              .isDraft == false and
+              .baseRefName == $base_branch and
+              .headRefName == $head_branch
+            ' <<<"${PR_DETAILS}" >/dev/null; then
+            echo "::error::The pull request is not the expected open, non-draft ${BRANCH} pull request into ${GITHUB_REF_NAME}."
             exit 1
           fi
 
@@ -151,15 +278,12 @@ jobs:
             exit 1
           fi
 
-          ENABLED_EXISTING_HEAD="false"
-          if [[ "${PUBLISH_BOTTLES}" = "true" && "${PREVIOUS_TRUE_COUNT}" = "0" && "${PREVIOUS_FALSE_COUNT}" = "1" ]]; then
-            ENABLED_EXISTING_HEAD="true"
+          REUSE_EXISTING_HEAD="false"
+          if [[ "${PUBLISH_BOTTLES}" = "true" && "${FORMULA_HEAD_CHANGED}" = "false" ]]; then
+            REUSE_EXISTING_HEAD="true"
           fi
 
           PUBLISH_URL="https://github.com/${GITHUB_REPOSITORY}/actions/workflows/publish-bottles.yml"
-          HANDOFF_FILE="$(mktemp)"
-          PR_BODY_FILE="$(mktemp)"
-          trap 'rm -f "${HANDOFF_FILE}" "${PR_BODY_FILE}"' EXIT
 
           {
             echo "## Bottle publication"
@@ -204,9 +328,37 @@ jobs:
 
           gh pr edit "${PR_URL}" --body-file "${PR_BODY_FILE}"
 
+          EXPECTED_MARKER="<!-- homebrew-atctl-publish-bottles=${PUBLISH_BOTTLES} head_sha=${PR_HEAD_SHA} -->"
+          if [[ "${PUBLISH_BOTTLES}" = "true" ]]; then
+            OPPOSITE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${PR_HEAD_SHA} -->"
+          else
+            OPPOSITE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${PR_HEAD_SHA} -->"
+          fi
+
+          PR_BODY_CONFIRMED="false"
+          for _ in {1..30}; do
+            if CONFIRMED_PR_DETAILS="$(gh pr view "${PR_URL}" --json body,headRefOid)"; then
+              CONFIRMED_HEAD_SHA="$(jq -r '.headRefOid // ""' <<<"${CONFIRMED_PR_DETAILS}")"
+              CONFIRMED_BODY="$(jq -r '.body // ""' <<<"${CONFIRMED_PR_DETAILS}")"
+              EXPECTED_MARKER_COUNT="$(grep -Fxc -- "${EXPECTED_MARKER}" <<<"${CONFIRMED_BODY}" || true)"
+              OPPOSITE_MARKER_COUNT="$(grep -Fxc -- "${OPPOSITE_MARKER}" <<<"${CONFIRMED_BODY}" || true)"
+
+              if [[ "${CONFIRMED_HEAD_SHA}" = "${PR_HEAD_SHA}" && "${EXPECTED_MARKER_COUNT}" = "1" && "${OPPOSITE_MARKER_COUNT}" = "0" ]]; then
+                PR_BODY_CONFIRMED="true"
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [[ "${PR_BODY_CONFIRMED}" != "true" ]]; then
+            echo "::error::Pull request ${PR_URL} did not expose exactly one ${PUBLISH_BOTTLES} publication marker for ${PR_HEAD_SHA}."
+            exit 1
+          fi
+
           CATCH_UP_STATUS="not-needed"
           FORMULA_CI_RUN_ID=""
-          if [[ "${ENABLED_EXISTING_HEAD}" = "true" ]]; then
+          if [[ "${REUSE_EXISTING_HEAD}" = "true" ]]; then
             CI_RUNS_JSON="$(
               gh api \
                 --method GET \

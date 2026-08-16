@@ -126,14 +126,48 @@ jobs:
           fi
 
           if [[ "${SOURCE}" = "automatic" ]]; then
-            PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
             TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
             FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
-            TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
-            FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+            ENABLED_MARKER_CONFIRMED="false"
 
-            if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
-              echo "::error::Automatic bottle publication is not enabled exactly once for the requested pull request head."
+            for _ in {1..30}; do
+              PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
+
+              if ! jq -e \
+                --arg default_branch "${DEFAULT_BRANCH}" \
+                --arg head_sha "${HEAD_SHA}" \
+                --arg repository "${GITHUB_REPOSITORY}" \
+                '
+                  .state == "open" and
+                  .draft == false and
+                  .base.ref == $default_branch and
+                  .head.sha == $head_sha and
+                  .head.repo.full_name == $repository and
+                  .user.login == "github-actions[bot]"
+                ' <<<"${PR_JSON}" >/dev/null; then
+                sleep 2
+                continue
+              fi
+
+              PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
+              TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
+              FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
+
+              if (( TRUE_COUNT > 1 || FALSE_COUNT > 1 || (TRUE_COUNT == 1 && FALSE_COUNT == 1) )); then
+                echo "::error::The Formula PR contains an ambiguous automatic-publication marker for ${HEAD_SHA}."
+                exit 1
+              fi
+
+              if [[ "${TRUE_COUNT}" = "1" && "${FALSE_COUNT}" = "0" ]]; then
+                ENABLED_MARKER_CONFIRMED="true"
+                break
+              fi
+
+              sleep 2
+            done
+
+            if [[ "${ENABLED_MARKER_CONFIRMED}" != "true" ]]; then
+              echo "::error::Automatic bottle publication did not converge to enabled for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
               exit 1
             fi
 
