@@ -1,54 +1,36 @@
 name: Publish Bottles
 
 run-name: >-
-  Bottle publication for PR #${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event.client_payload.pull_request || github.run_id }}
-  (${{ github.event_name == 'workflow_dispatch' && 'manual publication' || 'automatic publication' }})
+  Bottle publication for PR #${{ github.event.client_payload.pull_request || github.run_id }}
 
 on:
   repository_dispatch:
     types:
       - evaluate-bottle-publication
-  workflow_dispatch:
-    inputs:
-      pull_request:
-        description: "PR number shown in the generated Formula PR's Bottle publication section"
-        required: true
-        type: string
-      head_sha:
-        description: "Full 40-character head SHA shown in that Formula PR section"
-        required: true
-        type: string
 
 concurrency:
   group: >-
-    bottle-publication-pr-${{ github.event_name == 'workflow_dispatch' && inputs.pull_request || github.event.client_payload.pull_request || github.run_id }}
+    bottle-publication-pr-${{ github.event.client_payload.pull_request || github.run_id }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  prepare-publication:
-    name: Decide bottle publication
+  publish:
+    name: Decide and publish bottles
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: read
-      pull-requests: read
-    outputs:
-      formula_ci_run_id: ${{ steps.publication.outputs.formula_ci_run_id }}
-      head_sha: ${{ steps.publication.outputs.head_sha }}
-      pull_request: ${{ steps.publication.outputs.pull_request }}
-      ready: ${{ steps.publication.outputs.ready }}
-      source: ${{ steps.publication.outputs.source }}
+      checks: read
+      contents: write
+      issues: read
+      pull-requests: write
 
     steps:
       - name: Resolve and validate publication request
         id: publication
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          DISPATCH_HEAD_SHA: ${{ inputs.head_sha }}
-          DISPATCH_PULL_REQUEST: ${{ inputs.pull_request }}
-          EVENT_NAME: ${{ github.event_name }}
           FORMULA_CI_RUN_ID: ${{ github.event.client_payload.formula_ci_run_id }}
           GH_TOKEN: ${{ github.token }}
           REPOSITORY_DISPATCH_ACTION: ${{ github.event.action }}
@@ -62,38 +44,25 @@ jobs:
             exit 1
           fi
 
-          if [[ "${EVENT_NAME}" = "workflow_dispatch" ]]; then
-            SOURCE="manual"
-            REQUEST_KIND="manual"
-            PULL_REQUEST="${DISPATCH_PULL_REQUEST}"
-            HEAD_SHA="${DISPATCH_HEAD_SHA}"
-            FORMULA_CI_RUN_ID=""
-          elif [[ "${EVENT_NAME}" = "repository_dispatch" ]]; then
-            SOURCE="automatic"
-            REQUEST_KIND="${REPOSITORY_DISPATCH_ACTION}"
-            PULL_REQUEST="${REPOSITORY_DISPATCH_PULL_REQUEST}"
-            HEAD_SHA="${REPOSITORY_DISPATCH_HEAD_SHA}"
+          PULL_REQUEST="${REPOSITORY_DISPATCH_PULL_REQUEST}"
+          HEAD_SHA="${REPOSITORY_DISPATCH_HEAD_SHA}"
+          HEAD_BRANCH=""
+          READY="false"
 
-            if [[ "${REQUEST_KIND}" != "evaluate-bottle-publication" ]]; then
-              echo "::error::Unexpected repository_dispatch action: ${REPOSITORY_DISPATCH_ACTION}"
-              exit 1
-            fi
-          else
-            echo "::error::Unexpected publication event: ${EVENT_NAME}"
+          if [[ "${REPOSITORY_DISPATCH_ACTION}" != "evaluate-bottle-publication" ]]; then
+            echo "::error::Unexpected repository_dispatch action: ${REPOSITORY_DISPATCH_ACTION}"
             exit 1
           fi
 
           write_outputs() {
             {
               echo "formula_ci_run_id=${FORMULA_CI_RUN_ID}"
+              echo "head_branch=${HEAD_BRANCH}"
               echo "head_sha=${HEAD_SHA}"
               echo "pull_request=${PULL_REQUEST}"
               echo "ready=${READY}"
-              echo "source=${SOURCE}"
             } >>"${GITHUB_OUTPUT}"
           }
-
-          READY="false"
 
           if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::pull_request must be a positive pull request number without a leading #."
@@ -105,18 +74,16 @@ jobs:
             exit 1
           fi
 
-          if [[ "${SOURCE}" = "automatic" ]]; then
-            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::The automatic publication decision must identify a valid Formula CI run."
-              exit 1
-            fi
+          if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::The automatic publication request must identify a valid Formula CI run."
+            exit 1
           fi
 
           PR_MATCHED="false"
           for _ in {1..30}; do
             PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
-            PR_STATE="$(jq -r '.state' <<<"${PR_JSON}")"
-            CURRENT_HEAD_SHA="$(jq -r '.head.sha' <<<"${PR_JSON}")"
+            PR_STATE="$(jq -r '.state // ""' <<<"${PR_JSON}")"
+            CURRENT_HEAD_SHA="$(jq -r '.head.sha // ""' <<<"${PR_JSON}")"
 
             if [[ "${PR_STATE}" = "open" && "${CURRENT_HEAD_SHA}" = "${HEAD_SHA}" ]]; then
               PR_MATCHED="true"
@@ -130,45 +97,112 @@ jobs:
             sleep 2
           done
 
-          PR_STATE="$(jq -r '.state' <<<"${PR_JSON}")"
-          PR_HEAD_BRANCH="$(jq -r '.head.ref' <<<"${PR_JSON}")"
+          HEAD_BRANCH="$(jq -r '.head.ref // ""' <<<"${PR_JSON}")"
 
-          if [[ "${SOURCE}" = "automatic" && "${PR_MATCHED}" != "true" ]]; then
+          if [[ "${PR_MATCHED}" != "true" ]]; then
             write_outputs
             {
-              echo "## Bottle publication"
+              echo "## Bottle publication: stale request"
               echo
-              echo "The automatic request for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\` is stale because the pull request is closed or now has a different head."
+              echo "Pull request #${PULL_REQUEST} is closed or no longer points to \`${HEAD_SHA}\`."
               echo
-              echo "No publication was performed."
+              echo "No publication or branch deletion was performed."
             } >>"${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
 
-          if [[ "${SOURCE}" = "manual" && "${PR_MATCHED}" != "true" ]]; then
-            echo "::error::Pull request #${PULL_REQUEST} is not open at ${HEAD_SHA}."
-            exit 1
-          fi
-
-          if [[ ! "${PR_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Unexpected pull request head branch: ${PR_HEAD_BRANCH}"
+          if [[ ! "${HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Unexpected pull request head branch: ${HEAD_BRANCH}"
             exit 1
           fi
 
           if ! jq -e \
             --arg default_branch "${DEFAULT_BRANCH}" \
+            --arg head_branch "${HEAD_BRANCH}" \
             --arg head_sha "${HEAD_SHA}" \
             --arg repository "${GITHUB_REPOSITORY}" \
             '
               .state == "open" and
               .draft == false and
               .base.ref == $default_branch and
+              .head.ref == $head_branch and
               .head.sha == $head_sha and
               .head.repo.full_name == $repository and
               .user.login == "github-actions[bot]"
             ' <<<"${PR_JSON}" >/dev/null; then
             echo "::error::The pull request is not the expected open, non-draft, bot-created Formula PR at ${HEAD_SHA}."
             exit 1
+          fi
+
+          COMMIT_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}")"
+          if ! jq -e \
+            --arg head_sha "${HEAD_SHA}" \
+            '.sha == $head_sha and (.parents | length) == 1' <<<"${COMMIT_JSON}" >/dev/null; then
+            echo "::error::GitHub did not return the expected single-parent Formula commit ${HEAD_SHA}."
+            exit 1
+          fi
+
+          COMMIT_MESSAGE="$(jq -r '.commit.message // ""' <<<"${COMMIT_JSON}")"
+          PUBLICATION_SETTING=""
+          PUBLICATION_MARKER_COUNT=0
+          FORMULA_CHANGED=""
+          FORMULA_CHANGE_MARKER_COUNT=0
+          REQUEST_MARKER_COUNT=0
+          REQUEST_MARKER_PATTERN='^Homebrew-Atctl-Request: [1-9][0-9]*\.[1-9][0-9]*$'
+
+          while IFS= read -r MESSAGE_LINE; do
+            case "${MESSAGE_LINE}" in
+              "Homebrew-Atctl-Publish-Bottles: true")
+                PUBLICATION_SETTING="true"
+                PUBLICATION_MARKER_COUNT=$((PUBLICATION_MARKER_COUNT + 1))
+                ;;
+              "Homebrew-Atctl-Publish-Bottles: false")
+                PUBLICATION_SETTING="false"
+                PUBLICATION_MARKER_COUNT=$((PUBLICATION_MARKER_COUNT + 1))
+                ;;
+              "Homebrew-Atctl-Formula-Changed: true")
+                FORMULA_CHANGED="true"
+                FORMULA_CHANGE_MARKER_COUNT=$((FORMULA_CHANGE_MARKER_COUNT + 1))
+                ;;
+              "Homebrew-Atctl-Formula-Changed: false")
+                FORMULA_CHANGED="false"
+                FORMULA_CHANGE_MARKER_COUNT=$((FORMULA_CHANGE_MARKER_COUNT + 1))
+                ;;
+            esac
+
+            if [[ "${MESSAGE_LINE}" =~ ${REQUEST_MARKER_PATTERN} ]]; then
+              REQUEST_MARKER_COUNT=$((REQUEST_MARKER_COUNT + 1))
+            fi
+          done <<<"${COMMIT_MESSAGE}"
+
+          COMMIT_FILES="$(jq -r '.files[]?.filename' <<<"${COMMIT_JSON}")"
+          case "${COMMIT_FILES}" in
+            "")
+              OBSERVED_FORMULA_CHANGED="false"
+              ;;
+            "Formula/atctl.rb")
+              OBSERVED_FORMULA_CHANGED="true"
+              ;;
+            *)
+              echo "::error::The Formula request commit may only change Formula/atctl.rb or contain no file changes."
+              printf '%s\n' "${COMMIT_FILES}"
+              exit 1
+              ;;
+          esac
+
+          if [[
+            "${PUBLICATION_MARKER_COUNT}" -ne 1 ||
+            "${FORMULA_CHANGE_MARKER_COUNT}" -ne 1 ||
+            "${REQUEST_MARKER_COUNT}" -ne 1 ||
+            "${FORMULA_CHANGED}" != "${OBSERVED_FORMULA_CHANGED}"
+          ]]; then
+            echo "::error::The Formula commit's immutable request markers do not match its contents."
+            exit 1
+          fi
+
+          EXPECTED_CHANGED_FILES=""
+          if [[ "${FORMULA_CHANGED}" = "true" ]]; then
+            EXPECTED_CHANGED_FILES="Formula/atctl.rb"
           fi
 
           CHANGED_FILES_READY="false"
@@ -180,7 +214,7 @@ jobs:
                 --jq '.[].filename'
             )"
 
-            if [[ "${CHANGED_FILES}" = "Formula/atctl.rb" ]]; then
+            if [[ "${CHANGED_FILES}" = "${EXPECTED_CHANGED_FILES}" ]]; then
               CHANGED_FILES_READY="true"
               break
             fi
@@ -189,122 +223,97 @@ jobs:
           done
 
           if [[ "${CHANGED_FILES_READY}" != "true" ]]; then
-            echo "::error::Publication requires Formula/atctl.rb to be the pull request's only changed file."
+            echo "::error::The pull request files did not converge to the immutable Formula request commit."
             printf '%s\n' "${CHANGED_FILES}"
             exit 1
           fi
 
-          if [[ "${SOURCE}" = "automatic" ]]; then
-            CI_RUN_READY="false"
-            for _ in {1..30}; do
-              CI_RUN_JSON="$(
-                gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
-              )"
+          CI_RUN_READY="false"
+          for _ in {1..60}; do
+            CI_RUN_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}")"
+            CI_RUN_STATUS="$(jq -r '.status // ""' <<<"${CI_RUN_JSON}")"
 
-              if jq -e \
-                --arg head_branch "${PR_HEAD_BRANCH}" \
-                --arg head_sha "${HEAD_SHA}" \
-                --arg repository "${GITHUB_REPOSITORY}" \
-                --argjson pull_request "${PULL_REQUEST}" \
-                '
-                  .name == "Formula CI" and
-                  ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
-                  .event == "pull_request" and
-                  .status == "completed" and
-                  .conclusion == "success" and
-                  .head_branch == $head_branch and
-                  .head_sha == $head_sha and
-                  .head_repository.full_name == $repository and
-                  .actor.login == "github-actions[bot]" and
-                  any(.pull_requests[]?; .number == $pull_request)
-                ' <<<"${CI_RUN_JSON}" >/dev/null; then
-                CI_RUN_READY="true"
-                break
-              fi
-
-              if [[ "$(jq -r '.status' <<<"${CI_RUN_JSON}")" = "completed" ]]; then
-                break
-              fi
-
-              sleep 2
-            done
-
-            if [[ "${CI_RUN_READY}" != "true" ]]; then
-              echo "::error::Run ${FORMULA_CI_RUN_ID} is not the successful completed Formula CI run for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
-              exit 1
+            if jq -e \
+              --arg head_branch "${HEAD_BRANCH}" \
+              --arg head_sha "${HEAD_SHA}" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --argjson pull_request "${PULL_REQUEST}" \
+              '
+                .name == "Formula CI" and
+                ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
+                .event == "pull_request" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_branch == $head_branch and
+                .head_sha == $head_sha and
+                .head_repository.full_name == $repository and
+                any(.pull_requests[]?; .number == $pull_request)
+              ' <<<"${CI_RUN_JSON}" >/dev/null; then
+              CI_RUN_READY="true"
+              break
             fi
 
-            TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
-            FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
-            MARKER_READY="false"
-            for _ in {1..30}; do
-              PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
-              TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
-              FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
-
-              if [[
-                ("${TRUE_COUNT}" = "1" && "${FALSE_COUNT}" = "0") ||
-                ("${TRUE_COUNT}" = "0" && "${FALSE_COUNT}" = "1")
-              ]]; then
-                MARKER_READY="true"
-                break
-              fi
-
-              sleep 2
-              PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
-
-              if ! jq -e \
-                --arg head_sha "${HEAD_SHA}" \
-                '.state == "open" and .head.sha == $head_sha' <<<"${PR_JSON}" >/dev/null; then
-                break
-              fi
-            done
-
-            if [[ "${MARKER_READY}" != "true" ]]; then
-              echo "::error::Automatic bottle publication did not expose exactly one Enabled/Disabled marker for ${HEAD_SHA}."
-              exit 1
+            if [[ "${CI_RUN_STATUS}" = "completed" ]]; then
+              break
             fi
 
-            if [[ "${TRUE_COUNT}" = "0" && "${FALSE_COUNT}" = "1" ]]; then
-              write_outputs
-              {
-                echo "## Bottle publication: disabled"
-                echo
-                echo "Formula CI succeeded for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
-                echo
-                echo "Automatic bottle publication is **disabled** for this request. The workflow completed successfully without publishing bottles or updating \`main\`."
-              } >>"${GITHUB_STEP_SUMMARY}"
-              exit 0
+            sleep 5
+          done
+
+          if [[ "${CI_RUN_READY}" != "true" ]]; then
+            echo "::error::Run ${FORMULA_CI_RUN_ID} is not the successful completed Formula CI run for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
+            exit 1
+          fi
+
+          if [[ "${FORMULA_CHANGED}" = "false" ]]; then
+            write_outputs
+            {
+              echo "## Bottle publication: no Formula change"
+              echo
+              echo "Formula CI succeeded for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
+              echo
+              echo "The approved request contains no Formula change. The workflow completed successfully without publishing bottles, updating \`main\`, closing the pull request, or deleting its Formula branch."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [[ "${PUBLICATION_SETTING}" = "false" ]]; then
+            write_outputs
+            {
+              echo "## Bottle publication: disabled"
+              echo
+              echo "Formula CI succeeded for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
+              echo
+              echo "Automatic bottle publication is **disabled** for this immutable request. The workflow completed successfully without publishing bottles, updating \`main\`, closing the pull request, or deleting its Formula branch."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          ARTIFACT_READY="false"
+          for _ in {1..30}; do
+            ARTIFACTS_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100")"
+
+            if jq -e \
+              --arg head_sha "${HEAD_SHA}" \
+              '
+                any(
+                  .artifacts[]?;
+                  .name == "bottles_macos-26" and
+                  .expired == false and
+                  .size_in_bytes > 0 and
+                  .workflow_run.head_sha == $head_sha
+                )
+              ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
+              ARTIFACT_READY="true"
+              break
             fi
 
-            ARTIFACT_READY="false"
-            for _ in {1..15}; do
-              ARTIFACTS_JSON="$(
-                gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100"
-              )"
+            sleep 2
+          done
 
-              if jq -e \
-                --arg head_sha "${HEAD_SHA}" \
-                '
-                  any(
-                    .artifacts[]?;
-                    .name == "bottles_macos-26" and
-                    .expired == false and
-                    .size_in_bytes > 0 and
-                    .workflow_run.head_sha == $head_sha
-                  )
-                ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
-                ARTIFACT_READY="true"
-                break
-              fi
-
-              sleep 2
-            done
-
-            if [[ "${ARTIFACT_READY}" != "true" ]]; then
-              echo "::error::Formula CI run ${FORMULA_CI_RUN_ID} has no usable bottles_macos-26 artifact for ${HEAD_SHA}."
-              exit 1
-            fi
+          if [[ "${ARTIFACT_READY}" != "true" ]]; then
+            echo "::error::Formula CI run ${FORMULA_CI_RUN_ID} has no usable bottles_macos-26 artifact for ${HEAD_SHA}."
+            exit 1
           fi
 
           READY="true"
@@ -317,75 +326,48 @@ jobs:
             echo
             echo "Formula head: \`${HEAD_SHA}\`"
             echo
-            echo "Publication source: **${SOURCE}**"
-            if [[ "${SOURCE}" = "automatic" ]]; then
-              echo
-              echo "Formula CI run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
-            fi
+            echo "Formula CI run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
           } >>"${GITHUB_STEP_SUMMARY}"
 
-  publish-bottles:
-    name: Publish bottles and update main
-    needs: prepare-publication
-    if: >-
-      needs.prepare-publication.result == 'success' &&
-      needs.prepare-publication.outputs.ready == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      checks: read
-      contents: write
-      issues: read
-      pull-requests: write
+      - name: Set up Homebrew
+        if: steps.publication.outputs.ready == 'true'
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    steps:
+      - name: Set up Git author
+        if: steps.publication.outputs.ready == 'true'
+        uses: Homebrew/actions/git-user-config@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+
       - name: Revalidate publication
+        if: steps.publication.outputs.ready == 'true'
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          FORMULA_CI_RUN_ID: ${{ needs.prepare-publication.outputs.formula_ci_run_id }}
+          FORMULA_CI_RUN_ID: ${{ steps.publication.outputs.formula_ci_run_id }}
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}
-          PUBLICATION_SOURCE: ${{ needs.prepare-publication.outputs.source }}
-          PULL_REQUEST: ${{ needs.prepare-publication.outputs.pull_request }}
+          HEAD_BRANCH: ${{ steps.publication.outputs.head_branch }}
+          HEAD_SHA: ${{ steps.publication.outputs.head_sha }}
+          PULL_REQUEST: ${{ steps.publication.outputs.pull_request }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
-            echo "::error::Publish Bottles must run from the repository default branch ${DEFAULT_BRANCH}."
-            exit 1
-          fi
-
-          if [[ ! "${PULL_REQUEST}" =~ ^[1-9][0-9]*$ || ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::The prepared publication identifiers are invalid."
-            exit 1
-          fi
-
-          if [[ "${PUBLICATION_SOURCE}" != "automatic" && "${PUBLICATION_SOURCE}" != "manual" ]]; then
-            echo "::error::Unexpected publication source: ${PUBLICATION_SOURCE}"
-            exit 1
-          fi
-
           PR_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}")"
-          PR_HEAD_BRANCH="$(jq -r '.head.ref' <<<"${PR_JSON}")"
-
-          if [[ ! "${PR_HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Unexpected pull request head branch: ${PR_HEAD_BRANCH}"
-            exit 1
-          fi
 
           if ! jq -e \
             --arg default_branch "${DEFAULT_BRANCH}" \
+            --arg head_branch "${HEAD_BRANCH}" \
             --arg head_sha "${HEAD_SHA}" \
             --arg repository "${GITHUB_REPOSITORY}" \
             '
               .state == "open" and
               .draft == false and
               .base.ref == $default_branch and
+              .head.ref == $head_branch and
               .head.sha == $head_sha and
               .head.repo.full_name == $repository and
               .user.login == "github-actions[bot]"
             ' <<<"${PR_JSON}" >/dev/null; then
-            echo "::error::The pull request no longer matches the Formula PR at ${HEAD_SHA}."
+            echo "::error::The pull request no longer matches the validated Formula PR at ${HEAD_SHA}."
             exit 1
           fi
 
@@ -402,81 +384,62 @@ jobs:
             exit 1
           fi
 
-          if [[ "${PUBLICATION_SOURCE}" = "automatic" ]]; then
-            if [[ ! "${FORMULA_CI_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::Automatic publication lost its Formula CI run identifier."
-              exit 1
-            fi
+          COMMIT_MESSAGE="$(
+            gh api \
+              "/repos/${GITHUB_REPOSITORY}/git/commits/${HEAD_SHA}" \
+              --jq '.message'
+          )"
+          TRUE_MARKER_COUNT="$(grep -Fxc -- "Homebrew-Atctl-Publish-Bottles: true" <<<"${COMMIT_MESSAGE}" || true)"
+          FALSE_MARKER_COUNT="$(grep -Fxc -- "Homebrew-Atctl-Publish-Bottles: false" <<<"${COMMIT_MESSAGE}" || true)"
 
-            PR_BODY="$(jq -r '.body // ""' <<<"${PR_JSON}")"
-            TRUE_MARKER="<!-- homebrew-atctl-publish-bottles=true head_sha=${HEAD_SHA} -->"
-            FALSE_MARKER="<!-- homebrew-atctl-publish-bottles=false head_sha=${HEAD_SHA} -->"
-            TRUE_COUNT="$(grep -Fxc -- "${TRUE_MARKER}" <<<"${PR_BODY}" || true)"
-            FALSE_COUNT="$(grep -Fxc -- "${FALSE_MARKER}" <<<"${PR_BODY}" || true)"
-
-            if [[ "${TRUE_COUNT}" != "1" || "${FALSE_COUNT}" != "0" ]]; then
-              echo "::error::Automatic bottle publication is no longer enabled for the Formula pull request head."
-              exit 1
-            fi
-
-            CI_RUN_JSON="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}"
-            )"
-
-            if ! jq -e \
-              --arg head_branch "${PR_HEAD_BRANCH}" \
-              --arg head_sha "${HEAD_SHA}" \
-              --arg repository "${GITHUB_REPOSITORY}" \
-              --argjson pull_request "${PULL_REQUEST}" \
-              '
-                .name == "Formula CI" and
-                ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
-                .event == "pull_request" and
-                .status == "completed" and
-                .conclusion == "success" and
-                .head_branch == $head_branch and
-                .head_sha == $head_sha and
-                .head_repository.full_name == $repository and
-                .actor.login == "github-actions[bot]" and
-                any(.pull_requests[]?; .number == $pull_request)
-              ' <<<"${CI_RUN_JSON}" >/dev/null; then
-              echo "::error::The Formula CI run is no longer valid for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
-              exit 1
-            fi
-
-            ARTIFACTS_JSON="$(
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100"
-            )"
-
-            if ! jq -e \
-              --arg head_sha "${HEAD_SHA}" \
-              '
-                any(
-                  .artifacts[]?;
-                  .name == "bottles_macos-26" and
-                  .expired == false and
-                  .size_in_bytes > 0 and
-                  .workflow_run.head_sha == $head_sha
-                )
-              ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
-              echo "::error::The Formula CI bottles are no longer available for ${HEAD_SHA}."
-              exit 1
-            fi
+          if [[ "${TRUE_MARKER_COUNT}" != "1" || "${FALSE_MARKER_COUNT}" != "0" ]]; then
+            echo "::error::Automatic bottle publication is not enabled by the immutable Formula commit."
+            exit 1
           fi
 
-      - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          CI_RUN_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}")"
+          if ! jq -e \
+            --arg head_branch "${HEAD_BRANCH}" \
+            --arg head_sha "${HEAD_SHA}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --argjson pull_request "${PULL_REQUEST}" \
+            '
+              .name == "Formula CI" and
+              ((.path // "" | split("@")[0]) == ".github/workflows/ci.yml") and
+              .event == "pull_request" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_branch == $head_branch and
+              .head_sha == $head_sha and
+              .head_repository.full_name == $repository and
+              any(.pull_requests[]?; .number == $pull_request)
+            ' <<<"${CI_RUN_JSON}" >/dev/null; then
+            echo "::error::The Formula CI run is no longer valid for pull request #${PULL_REQUEST} at ${HEAD_SHA}."
+            exit 1
+          fi
 
-      - name: Set up Git author
-        uses: Homebrew/actions/git-user-config@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+          ARTIFACTS_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${FORMULA_CI_RUN_ID}/artifacts?per_page=100")"
+          if ! jq -e \
+            --arg head_sha "${HEAD_SHA}" \
+            '
+              any(
+                .artifacts[]?;
+                .name == "bottles_macos-26" and
+                .expired == false and
+                .size_in_bytes > 0 and
+                .workflow_run.head_sha == $head_sha
+              )
+            ' <<<"${ARTIFACTS_JSON}" >/dev/null; then
+            echo "::error::The Formula CI bottles are no longer available for ${HEAD_SHA}."
+            exit 1
+          fi
 
       - name: Publish bottles
+        if: steps.publication.outputs.ready == 'true'
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ needs.prepare-publication.outputs.head_sha }}
-          PULL_REQUEST: ${{ needs.prepare-publication.outputs.pull_request }}
+          HEAD_SHA: ${{ steps.publication.outputs.head_sha }}
+          PULL_REQUEST: ${{ steps.publication.outputs.pull_request }}
         run: |
           brew pr-pull --debug \
             --tap="$GITHUB_REPOSITORY" \
@@ -485,6 +448,78 @@ jobs:
             "$PULL_REQUEST"
 
       - name: Push bottle commit
+        if: steps.publication.outputs.ready == 'true'
         uses: Homebrew/actions/git-try-push@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
         with:
           branch: main
+
+      - name: Remove published Formula branch
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          HEAD_BRANCH: ${{ steps.publication.outputs.head_branch }}
+          HEAD_SHA: ${{ steps.publication.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${HEAD_BRANCH}" =~ ^formula/[A-Za-z0-9._-]+$ || ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The validated Formula branch cleanup identifiers are invalid."
+            exit 1
+          fi
+
+          REMOTE_BRANCH_REF="refs/heads/${HEAD_BRANCH}"
+          REMOTE_BRANCH_SHA="$(
+            git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+
+          if [[ -z "${REMOTE_BRANCH_SHA}" ]]; then
+            {
+              echo "## Formula branch cleanup"
+              echo
+              echo "\`${HEAD_BRANCH}\` was already absent after publication."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [[ "${REMOTE_BRANCH_SHA}" != "${HEAD_SHA}" ]]; then
+            echo "::error::Refusing to delete ${HEAD_BRANCH}: it now points to ${REMOTE_BRANCH_SHA}, not the published ${HEAD_SHA}."
+            exit 1
+          fi
+
+          if ! git push \
+            --force-with-lease="${REMOTE_BRANCH_REF}:${HEAD_SHA}" \
+            origin \
+            ":${REMOTE_BRANCH_REF}"; then
+            REMOTE_BRANCH_SHA="$(
+              git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+                awk 'NR == 1 { print $1 }'
+            )"
+
+            if [[ -z "${REMOTE_BRANCH_SHA}" ]]; then
+              {
+                echo "## Formula branch cleanup"
+                echo
+                echo "\`${HEAD_BRANCH}\` was removed concurrently after publication."
+              } >>"${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+
+            echo "::error::Could not delete ${HEAD_BRANCH}; it remains at ${REMOTE_BRANCH_SHA}."
+            exit 1
+          fi
+
+          REMOTE_BRANCH_SHA="$(
+            git ls-remote --heads origin "${REMOTE_BRANCH_REF}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+
+          if [[ -n "${REMOTE_BRANCH_SHA}" ]]; then
+            echo "::error::Git reported success, but ${HEAD_BRANCH} still exists at ${REMOTE_BRANCH_SHA}."
+            exit 1
+          fi
+
+          {
+            echo "## Formula branch cleanup"
+            echo
+            echo "Removed published branch \`${HEAD_BRANCH}\` at \`${HEAD_SHA}\`."
+          } >>"${GITHUB_STEP_SUMMARY}"

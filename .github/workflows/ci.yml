@@ -1,12 +1,7 @@
 name: Formula CI
 
 on:
-  pull_request:
-    paths:
-      - "Formula/**"
-      - "config/**"
-      - "scripts/**"
-      - ".github/workflows/ci.yml"
+  pull_request: {}
   push:
     branches:
       - main
@@ -146,6 +141,56 @@ jobs:
             exit 1
           fi
 
+          COMMIT_JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}")"
+          if ! jq -e \
+            --arg head_sha "${HEAD_SHA}" \
+            '.sha == $head_sha and (.parents | length) == 1' <<<"${COMMIT_JSON}" >/dev/null; then
+            echo "::error::The Formula CI head is not the expected single-parent commit ${HEAD_SHA}."
+            exit 1
+          fi
+
+          COMMIT_MESSAGE="$(jq -r '.commit.message // ""' <<<"${COMMIT_JSON}")"
+          FORMULA_CHANGED=""
+          FORMULA_CHANGE_MARKER_COUNT=0
+
+          while IFS= read -r MESSAGE_LINE; do
+            case "${MESSAGE_LINE}" in
+              "Homebrew-Atctl-Formula-Changed: true")
+                FORMULA_CHANGED="true"
+                FORMULA_CHANGE_MARKER_COUNT=$((FORMULA_CHANGE_MARKER_COUNT + 1))
+                ;;
+              "Homebrew-Atctl-Formula-Changed: false")
+                FORMULA_CHANGED="false"
+                FORMULA_CHANGE_MARKER_COUNT=$((FORMULA_CHANGE_MARKER_COUNT + 1))
+                ;;
+            esac
+          done <<<"${COMMIT_MESSAGE}"
+
+          COMMIT_FILES="$(jq -r '.files[]?.filename' <<<"${COMMIT_JSON}")"
+          case "${COMMIT_FILES}" in
+            "")
+              OBSERVED_FORMULA_CHANGED="false"
+              ;;
+            "Formula/atctl.rb")
+              OBSERVED_FORMULA_CHANGED="true"
+              ;;
+            *)
+              echo "::error::The Formula request commit may only change Formula/atctl.rb or contain no file changes."
+              printf '%s\n' "${COMMIT_FILES}"
+              exit 1
+              ;;
+          esac
+
+          if [[ "${FORMULA_CHANGE_MARKER_COUNT}" -ne 1 || "${FORMULA_CHANGED}" != "${OBSERVED_FORMULA_CHANGED}" ]]; then
+            echo "::error::The immutable Formula change marker does not match commit ${HEAD_SHA}."
+            exit 1
+          fi
+
+          EXPECTED_CHANGED_FILES=""
+          if [[ "${FORMULA_CHANGED}" = "true" ]]; then
+            EXPECTED_CHANGED_FILES="Formula/atctl.rb"
+          fi
+
           CHANGED_FILES_READY="false"
           for _ in {1..30}; do
             CHANGED_FILES="$(
@@ -155,7 +200,7 @@ jobs:
                 --jq '.[].filename'
             )"
 
-            if [[ "${CHANGED_FILES}" = "Formula/atctl.rb" ]]; then
+            if [[ "${CHANGED_FILES}" = "${EXPECTED_CHANGED_FILES}" ]]; then
               CHANGED_FILES_READY="true"
               break
             fi
@@ -164,7 +209,7 @@ jobs:
           done
 
           if [[ "${CHANGED_FILES_READY}" != "true" ]]; then
-            echo "::error::The publication decision requires Formula/atctl.rb to be the pull request's only changed file."
+            echo "::error::The pull request files did not converge to the immutable Formula request commit."
             printf '%s\n' "${CHANGED_FILES}"
             exit 1
           fi
@@ -194,5 +239,9 @@ jobs:
             echo
             echo "Requested **Publish Bottles** for pull request #${PULL_REQUEST} at \`${HEAD_SHA}\`."
             echo
-            echo "That workflow will stop successfully when publication is disabled, or publish automatically when it is enabled."
+            if [[ "${FORMULA_CHANGED}" = "false" ]]; then
+              echo "That workflow will record the approved no-change request and finish without publication."
+            else
+              echo "That workflow will stop successfully when publication is disabled, or publish automatically when it is enabled."
+            fi
           } >>"${GITHUB_STEP_SUMMARY}"
