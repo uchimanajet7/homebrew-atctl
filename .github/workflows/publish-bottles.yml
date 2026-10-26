@@ -449,7 +449,7 @@ jobs:
 
       - name: Push bottle commit
         if: steps.publication.outputs.ready == 'true'
-        uses: Homebrew/actions/git-try-push@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        uses: Homebrew/actions/git-try-push@4790763c0a3ba4036f72634dc079c4a7dfcd4878 # 2026.10.19.1
         with:
           branch: main
 
